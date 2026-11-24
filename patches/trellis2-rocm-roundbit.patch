@@ -1,0 +1,1872 @@
+diff --git a/README.md b/README.md
+index 550e1c5..631ae08 100644
+--- a/README.md
++++ b/README.md
+@@ -64,8 +64,38 @@ bash ./setup.sh
+ 3\. Click “Agree and access repository” to accept the license.<br>
+ 4\. Activate your Hugging Face token in the terminal.<br>
+ 
++## Local AMD fixes (7900 XTX, ROCm 7.14, transformers 5)
++- `./run_amd.sh <script>`: runs with the repo venv, `PYTHONNOUSERSITE=1`, no `expandable_segments` (corrupts tensors on ROCm), quiet logging.
++- Models load lazily with a bounded host-RAM cache (`TRELLIS_MODEL_CACHE_GB`, default 5; `TRELLIS_LAZY_LOAD=0` restores eager loading). The full 16 GB checkpoint set no longer gets OOM-killed on a 32 GB host.
++- Lazy models are built directly on the GPU and their weights streamed tensor by tensor (`TRELLIS_LOAD_ON_GPU=0` = old CPU path). The CPU path built each 1.3B DiT in fp32 (~5 GB) plus a full state-dict copy, which got `1024_cascade` killed by the RAM watchdog. Checked bit-identical against the stock loader. `1024_cascade` test: generate 154 s, GLB 29 s, render 17 s, VRAM peak 8.5 GB, RSS peak 12.2 GB.
++- Background removal: `TRELLIS_REMBG=auto|transparent_background|birefnet`. `auto` falls back to transparent-background when the gated RMBG-2.0 cannot be loaded.
++- DINOv3 feature extractor works with transformers 5 (layers moved to `model.model.layer`).
++- EXR environment maps: falls back to the OpenEXR bindings when OpenCV has no OpenEXR support (`render_utils.load_hdri`).
++- nvdiffrast-hip: `patches/nvdiffrast-hip-rocm-fixes.patch` (applied by `setup.sh`) fixes triangles dropped by the rasterizer (speckles in renders and baked textures), depth peeling and a missing `__syncwarp` fence. `NVDR_HIP_VERBOSE=1` re-enables the rasterizer diagnostics.
++- Tests: `tests_amd/` (`test_pipeline.py` end to end; `raster_*.py` rasterizer checks against a brute-force reference).
++
+ ## Run app:
+ ```bash
+ source .venv/bin/activate
+ python ./app.py
+-```
+\ No newline at end of file
++```
++
++## Symmetry (local addition)
++Most generated objects are mirror-symmetric, but the model only produces that approximately.
++`pipeline.run(..., symmetry='auto')` (app: *Symmetry* dropdown, default `auto`) detects mirror
++planes through the grid centre from the stage-1 occupancy and then enforces them without retraining:
++
++1. sparse-structure occupancy logits are averaged with their mirror,
++2. every shape-decoder subdivision decision is averaged with the mirrored child (symmetric voxel set at all levels),
++3. the 7 flexible-dual-grid outputs are mirrored with the exact rule (vertex offset `f -> -f` on the mirror axis,
++   edge flags of the other axes shift one voxel), giving an exactly symmetric mesh,
++4. PBR voxels are averaged with their mirror where both sides agree; strong differences (logos, text) are kept.
++
++`symmetry` also accepts `'off'` (library default) or explicit axes such as `'x'`, `'xy'`; z is up.
++For export, `trellis2.utils.symmetry_glb.to_glb_mirrored` (app: *Mirrored UVs*) unwraps and bakes only one
++half per mirror axis and shares the texture between halves (2x texel area per axis, no seam on the plane).
++It is used only when the texture gate left at most 5% of mirrored voxel pairs asymmetric (otherwise side-specific
++details would be replaced by the mirror of the other side).
++
++Tests: `./run_amd.sh tests_amd/test_symmetry.py` (unit, ~10 s), `tests_amd/test_symmetry_glb.py` (export, ~40 s),
++`tests_amd/sym_calibrate.py` (detection scores for the example images), `tests_amd/sym_compare.py` (off vs auto).
+\ No newline at end of file
+diff --git a/app.py b/app.py
+index e8e35cc..31b172f 100644
+--- a/app.py
++++ b/app.py
+@@ -4,7 +4,7 @@ print("[STARTUP] Gradio imported")
+ 
+ import os
+ os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
++# expandable_segments is left off: it corrupts tensors on the ROCm allocator.
+ from datetime import datetime
+ import shutil
+ import cv2
+@@ -25,6 +25,8 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
+ print("[STARTUP] Trellis2ImageTo3DPipeline imported")
+ from trellis2.renderers import EnvMap
+ from trellis2.utils import render_utils
++from trellis2.utils import symmetry as sym
++from trellis2.utils.symmetry_glb import to_glb_mirrored, choose_uv_mirror_axes
+ print("[STARTUP] Trellis2 renderers and utils imported")
+ import o_voxel
+ print("[STARTUP] o_voxel imported")
+@@ -351,13 +353,14 @@ def preprocess_image(image: Image.Image) -> Image.Image:
+     return processed_image
+ 
+ 
+-def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
++def pack_state(latents: Tuple[SparseTensor, SparseTensor, int], symmetry: Optional[dict] = None) -> dict:
+     shape_slat, tex_slat, res = latents
+     return {
+         'shape_slat_feats': shape_slat.feats.cpu().numpy(),
+         'tex_slat_feats': tex_slat.feats.cpu().numpy(),
+         'coords': shape_slat.coords.cpu().numpy(),
+         'res': res,
++        'symmetry_axes': list((symmetry or {}).get('axes', ())),
+     }
+     
+     
+@@ -395,6 +398,7 @@ def image_to_3d(
+     tex_slat_guidance_rescale: float,
+     tex_slat_sampling_steps: int,
+     tex_slat_rescale_t: float,
++    symmetry: str,
+     req: gr.Request,
+     progress=gr.Progress(track_tqdm=True),
+ ) -> str:
+@@ -427,11 +431,16 @@ def image_to_3d(
+             "1536": "1536_cascade",
+         }[resolution],
+         return_latent=True,
++        symmetry=symmetry,
+     )
+     mesh = outputs[0]
++    sym_info = mesh.symmetry
+     mesh.simplify(16777216) # nvdiffrast limit
+     images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
+-    state = pack_state(latents)
++    state = pack_state(latents, sym_info)
++    sym_scores = ', '.join(f"{k} {v:.2f}" for k, v in sym_info.get('scores', {}).items())
++    sym_text = (f"mirror axes <b>{sym.axes_to_str(sym_info['axes'])}</b>" if sym_info['axes'] else "none applied") + \
++        f" (mode {sym_info.get('mode', 'off')}; occupancy mirror IoU {sym_scores}; detection threshold {sym.DEFAULT_DETECT_THRESHOLD})"
+     torch.cuda.empty_cache()
+     
+     # --- HTML Construction ---
+@@ -477,6 +486,7 @@ def image_to_3d(
+             <div class="tips-text">
+                 <p>● <b>Render Mode</b> - Click on the circular buttons to switch between different render modes.</p>
+                 <p>● <b>View Angle</b> - Drag the slider to change the view angle.</p>
++                <p>● <b>Symmetry</b> - {sym_text}</p>
+             </div>
+         </div>
+         
+@@ -504,6 +514,7 @@ def extract_glb(
+     state: dict,
+     decimation_target: int,
+     texture_size: int,
++    mirror_uvs: bool,
+     req: gr.Request,
+     progress=gr.Progress(track_tqdm=True),
+ ) -> Tuple[str, str]:
+@@ -523,8 +534,13 @@ def extract_glb(
+ 
+     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+     shape_slat, tex_slat, res = unpack_state(state)
+-    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+-    glb = o_voxel.postprocess.to_glb(
++    mesh = pipeline.decode_latent(shape_slat, tex_slat, res, tuple(state.get('symmetry_axes', ())))[0]
++    uv_axes = choose_uv_mirror_axes(mesh.symmetry) if mirror_uvs else ()
++    if mesh.symmetry['axes']:
++        print(f"[symmetry] axes {sym.axes_to_str(mesh.symmetry['axes'])}, texture asym {mesh.symmetry['tex_asym']}, "
++              f"mirrored UVs on '{sym.axes_to_str(uv_axes)}'")
++    glb = to_glb_mirrored(
++        mirror_axes=uv_axes,
+         vertices=mesh.vertices,
+         faces=mesh.faces,
+         attr_volume=mesh.attrs,
+@@ -564,6 +580,12 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
+             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
+             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
+             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
++            symmetry = gr.Dropdown(
++                ["auto", "off", "x", "y", "z", "xy", "xz", "yz", "xyz"], value="auto", label="Symmetry",
++                info="Mirror planes through the grid centre (z is up). 'auto' detects them from the sparse structure.")
++            mirror_uvs = gr.Checkbox(
++                label="Mirrored UVs", value=True,
++                info="Share texture space between mirrored halves when the texture is symmetric (2x texel density per axis).")
+             
+             generate_btn = gr.Button("Generate")
+                 
+@@ -635,6 +657,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
+             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
+             shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
+             tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
++            symmetry,
+         ],
+         outputs=[output_buf, preview_output],
+     )
+@@ -643,7 +666,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
+         lambda: gr.Walkthrough(selected=1), outputs=walkthrough
+     ).then(
+         extract_glb,
+-        inputs=[output_buf, decimation_target, texture_size],
++        inputs=[output_buf, decimation_target, texture_size, mirror_uvs],
+         outputs=[glb_output, download_btn],
+     )
+         
+@@ -681,15 +704,15 @@ if __name__ == "__main__":
+     
+     envmap = {
+         'forest': EnvMap(torch.tensor(
+-            cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
++            render_utils.load_hdri('assets/hdri/forest.exr'),
+             dtype=torch.float32, device='cuda'
+         )),
+         'sunset': EnvMap(torch.tensor(
+-            cv2.cvtColor(cv2.imread('assets/hdri/sunset.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
++            render_utils.load_hdri('assets/hdri/sunset.exr'),
+             dtype=torch.float32, device='cuda'
+         )),
+         'courtyard': EnvMap(torch.tensor(
+-            cv2.cvtColor(cv2.imread('assets/hdri/courtyard.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
++            render_utils.load_hdri('assets/hdri/courtyard.exr'),
+             dtype=torch.float32, device='cuda'
+         )),
+     }
+diff --git a/app_texturing.py b/app_texturing.py
+index 50b2873..32dfe03 100644
+--- a/app_texturing.py
++++ b/app_texturing.py
+@@ -1,7 +1,7 @@
+ import gradio as gr
+ 
+ import os
+-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
++# expandable_segments is left off: it corrupts tensors on the ROCm allocator.
+ from datetime import datetime
+ import shutil
+ from typing import *
+diff --git a/example.py b/example.py
+index 475a3b1..48083a3 100644
+--- a/example.py
++++ b/example.py
+@@ -1,6 +1,6 @@
+ import os
+ os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # Can save GPU memory
++# expandable_segments is left off: it corrupts tensors on the ROCm allocator.
+ import cv2
+ import imageio
+ from PIL import Image
+@@ -12,7 +12,7 @@ import o_voxel
+ 
+ # 1. Setup Environment Map
+ envmap = EnvMap(torch.tensor(
+-    cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
++    render_utils.load_hdri('assets/hdri/forest.exr'),
+     dtype=torch.float32, device='cuda'
+ ))
+ 
+diff --git a/example_texturing.py b/example_texturing.py
+index 5cb5ffc..8932c83 100644
+--- a/example_texturing.py
++++ b/example_texturing.py
+@@ -1,5 +1,5 @@
+ import os
+-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # Can save GPU memory
++# expandable_segments is left off: it corrupts tensors on the ROCm allocator.
+ import trimesh
+ from PIL import Image
+ from trellis2.pipelines import Trellis2TexturingPipeline
+diff --git a/setup.sh b/setup.sh
+index 9deca02..816ee8e 100755
+--- a/setup.sh
++++ b/setup.sh
+@@ -52,11 +52,15 @@ fi
+ 
+ git clone https://github.com/CalebisGross/TRELLIS-AMD ./trellis
+ cd ./trellis
+-git checkout 2ccf54e8ff7aee0c519d37717bee6d95cf75357e
++git checkout 23a1b81906e39bb730659b71760c69440ea0c001
+ mv ./extensions/nvdiffrast-hip/ ../
+ cd ..
+ rm -rf ./trellis
+ cd ./nvdiffrast-hip
++# Rasterizer fixes for RDNA3 (see patches/nvdiffrast-hip-rocm-fixes.patch):
++# lane masks under divergence (dropped/duplicated triangles), depth peeling,
++# __syncwarp memory fence, coarse warp-emit arrays back in LDS.
++patch -p1 < "$SCRIPT_DIR/patches/nvdiffrast-hip-rocm-fixes.patch"
+ uv pip install . --no-build-isolation
+ 
+ cd ..
+diff --git a/trellis2/datasets/structured_latent_svpbr.py b/trellis2/datasets/structured_latent_svpbr.py
+index c2a43a8..d43b3b4 100644
+--- a/trellis2/datasets/structured_latent_svpbr.py
++++ b/trellis2/datasets/structured_latent_svpbr.py
+@@ -11,7 +11,7 @@ from ..modules.sparse import SparseTensor, sparse_cat
+ from ..representations import MeshWithVoxel
+ from ..renderers import PbrMeshRenderer, EnvMap
+ from ..utils.data_utils import load_balanced_group_indices
+-from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
++from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics, load_hdri
+ 
+ 
+ class SLatPbrVisMixin:
+@@ -111,7 +111,7 @@ class SLatPbrVisMixin:
+         renderer.rendering_options.ssaa = 2
+         renderer.rendering_options.peel_layers = 8
+         envmap = EnvMap(torch.tensor(
+-            cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
++            load_hdri('assets/hdri/forest.exr'),
+             dtype=torch.float32, device='cuda'
+         ))
+         
+diff --git a/trellis2/models/__init__.py b/trellis2/models/__init__.py
+index d4fed03..0e9a582 100644
+--- a/trellis2/models/__init__.py
++++ b/trellis2/models/__init__.py
+@@ -35,13 +35,105 @@ def __getattr__(name):
+     return globals()[name]
+ 
+ 
+-def from_pretrained(path: str, **kwargs):
++def _stream_into(model, model_file: str, device, only=None) -> None:
++    """Copy checkpoint tensors one at a time into the (already allocated) model.
++
++    Same result as load_state_dict(load_file(...), strict=False), but host RAM never
++    holds more than one tensor of the checkpoint.
++    """
++    import torch
++    from safetensors import safe_open
++    targets = model.state_dict(keep_vars=True)
++    with torch.no_grad(), safe_open(model_file, framework="pt", device="cpu") as f:
++        for key in f.keys():
++            dst = targets.get(key)
++            if dst is None or (only is not None and key not in only):  # strict=False: unexpected keys ignored
++                continue
++            src = f.get_tensor(key)
++            if dst.shape != src.shape:
++                raise RuntimeError(f"size mismatch for {key}: checkpoint {tuple(src.shape)} vs model {tuple(dst.shape)}")
++            dst.copy_(src.to(device=dst.device, dtype=dst.dtype, non_blocking=False))
++            del src
++
++
++def _recompute_rope(model, device):
++    """Tensors __init__ computes that are not in the checkpoint; on the meta device they hold no values."""
++    import torch
++    from ..modules.attention import RotaryPositionEmbedder
++    # computed on `device` exactly as __init__ does under torch.device(device): CPU and GPU pow differ in the
++    # last bit, which changes the sampled mesh
++    with torch.device(device):
++        for m in model.modules():   # RotaryPositionEmbedder and SparseRotaryPositionEmbedder: freqs is no buffer
++            f = getattr(m, 'freqs', None)
++            if isinstance(f, torch.Tensor) and f.is_meta and hasattr(m, 'freq_dim') and hasattr(m, 'rope_freq'):
++                freqs = torch.arange(m.freq_dim, dtype=torch.float32) / m.freq_dim
++                m.freqs = m.rope_freq[0] / (m.rope_freq[1] ** freqs)
++        if getattr(model, 'rope_phases', None) is not None and getattr(model, 'pe_mode', None) == 'rope':
++            res = model.resolution
++            coords = torch.meshgrid(*[torch.arange(res, device=device) for _ in range(3)], indexing='ij')
++            coords = torch.stack(coords, dim=-1).reshape(-1, 3)
++            with torch.no_grad():
++                model.rope_phases.copy_(RotaryPositionEmbedder(model.model_channels // model.num_heads, 3)(coords))
++
++
++# checkpoint-less tensors _build_on_meta knows how to fill (anything else -> old construction path)
++_RECOMPUTED = {'rope_phases'}
++# callables fn(path, model, device) run on the meta-built model before anything is allocated, e.g. to swap layers
++# for quantized ones that load their own weights (RoundBit): the replaced weights are then never allocated
++META_HOOKS = []
++
++
++def _materialize(model, device) -> None:
++    """to_empty for the tensors still on the meta device only (layers a hook already loaded stay as they are)."""
++    import torch
++    for m in model.modules():
++        for name, p in list(m._parameters.items()):
++            if p is not None and p.is_meta:
++                m._parameters[name] = torch.nn.Parameter(torch.empty_like(p, device=device),
++                                                         requires_grad=p.requires_grad)
++        for name, b in list(m._buffers.items()):
++            if b is not None and b.is_meta:
++                m._buffers[name] = torch.empty_like(b, device=device)
++
++
++def _build_on_meta(config, model_file: str, device, kwargs, path: str = ""):
++    """Build the model on the meta device (no memory), allocate it on `device` in its final dtypes and stream the
++    checkpoint in. The old path builds it on the GPU in fp32 first: a 1.3B DiT peaked at 4.95 GiB while loading
++    instead of 2.4 GiB. Returns None (caller falls back) when a tensor would stay uninitialised."""
++    import torch
++    from safetensors import safe_open
++    with torch.device('meta'):
++        model = __getattr__(config['name'])(**config['args'], **kwargs)
++    with safe_open(model_file, framework="pt", device="cpu") as f:
++        keys = set(f.keys())
++    for hook in META_HOOKS:
++        hook(path, model, device)
++    missing = [k for k, v in model.state_dict().items() if k not in keys and v.is_meta]
++    if any(k.split('.')[-1] not in _RECOMPUTED for k in missing):
++        return None
++    fresh = {k for k, v in model.state_dict(keep_vars=True).items() if v.is_meta}  # not loaded by a hook
++    _materialize(model, device)
++    _stream_into(model, model_file, device, only=fresh)
++    _recompute_rope(model, device)
++    for m in model.modules():       # plain tensor attributes created in __init__ (not params / buffers)
++        for name, v in vars(m).items():
++            if isinstance(v, torch.Tensor) and v.is_meta:
++                del model
++                torch.cuda.empty_cache()
++                return None
++    return model
++
++
++def from_pretrained(path: str, device=None, **kwargs):
+     """
+     Load a model from a pretrained checkpoint.
+ 
+     Args:
+         path: The path to the checkpoint. Can be either local path or a Hugging Face model name.
+               NOTE: config file and model file should take the name f'{path}.json' and f'{path}.safetensors' respectively.
++        device: When set to a GPU device, the model is built directly on it and the
++                checkpoint is streamed tensor by tensor (no fp32 CPU init, no full
++                state-dict copy in host RAM). Default: stock CPU loading.
+         **kwargs: Additional arguments for the model constructor.
+     """
+     import os
+@@ -62,6 +154,16 @@ def from_pretrained(path: str, **kwargs):
+ 
+     with open(config_file, 'r') as f:
+         config = json.load(f)
++    if device is not None and str(device) != 'cpu':
++        import torch
++        if os.environ.get('TRELLIS_META_INIT', '1') != '0':
++            model = _build_on_meta(config, model_file, device, kwargs, path)
++            if model is not None:
++                return model
++        with torch.device(device):
++            model = __getattr__(config['name'])(**config['args'], **kwargs)
++        _stream_into(model, model_file, device)
++        return model
+     model = __getattr__(config['name'])(**config['args'], **kwargs)
+     model.load_state_dict(load_file(model_file), strict=False)
+ 
+diff --git a/trellis2/models/sc_vaes/sparse_unet_vae.py b/trellis2/models/sc_vaes/sparse_unet_vae.py
+index b9902a1..9a9c561 100644
+--- a/trellis2/models/sc_vaes/sparse_unet_vae.py
++++ b/trellis2/models/sc_vaes/sparse_unet_vae.py
+@@ -495,6 +495,8 @@ class SparseUnetVaeDecoder(nn.Module):
+                         h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                 else:
+                     h = block(h)
++            if self.low_vram:   # each level is larger: cached blocks of the previous one are never reused
++                torch.cuda.empty_cache()
+         h = h.type(x.dtype)
+         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+         h = self.output_layer(h)
+@@ -519,4 +521,6 @@ class SparseUnetVaeDecoder(nn.Module):
+                     h, sub = block(h)
+                 else:
+                     h = block(h)
++            if self.low_vram:
++                torch.cuda.empty_cache()
+        
+\ No newline at end of file
+diff --git a/trellis2/modules/image_feature_extractor.py b/trellis2/modules/image_feature_extractor.py
+index c3cb515..608f085 100644
+--- a/trellis2/modules/image_feature_extractor.py
++++ b/trellis2/modules/image_feature_extractor.py
+@@ -83,7 +83,10 @@ class DinoV3FeatureExtractor:
+         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
+         position_embeddings = self.model.rope_embeddings(image)
+ 
+-        for i, layer_module in enumerate(self.model.layer):
++        # transformers >= 5 moved the blocks into a DINOv3ViTEncoder submodule
++        # (DINOv3ViTModel.layer -> DINOv3ViTModel.model.layer)
++        layers = self.model.layer if hasattr(self.model, 'layer') else self.model.model.layer
++        for i, layer_module in enumerate(layers):
+             hidden_states = layer_module(
+                 hidden_states,
+                 position_embeddings=position_embeddings,
+diff --git a/trellis2/pipelines/base.py b/trellis2/pipelines/base.py
+index 331e1ed..ace48f4 100644
+--- a/trellis2/pipelines/base.py
++++ b/trellis2/pipelines/base.py
+@@ -4,6 +4,84 @@ import torch.nn as nn
+ from .. import models
+ 
+ 
++class LazyModels(dict):
++    """
++    Model dict that loads checkpoints on first access and keeps only a bounded
++    amount of weights resident in host RAM.
++
++    TRELLIS.2-4B is ~16 GB of weights; loading all of it up front (as the
++    stock pipeline does) does not fit next to anything else on a 32 GB host.
++    In low-VRAM mode the pipeline moves one model at a time to the GPU, so the
++    rest can stay on disk. Models sitting on the CPU are dropped least-recently
++    -used first once they exceed TRELLIS_MODEL_CACHE_GB (default 5).
++    """
++    def __init__(self, specs: dict, loader: Callable):
++        super().__init__()
++        self._specs = dict(specs)
++        self._loader = loader
++        self._budget = float(__import__('os').environ.get('TRELLIS_MODEL_CACHE_GB', '5')) * 2**30
++        # Set by the pipeline: device new models are built on (GPU -> no fp32 CPU init,
++        # weights streamed tensor by tensor; TRELLIS_LOAD_ON_GPU=0 keeps CPU loading).
++        self._device_fn = None
++
++    @staticmethod
++    def _cpu_bytes(model: nn.Module) -> int:
++        return sum(p.numel() * p.element_size() for p in model.parameters() if p.device.type == 'cpu')
++
++    def _evict(self, keep: str = None):
++        import gc
++        resident = [(k, self._cpu_bytes(m)) for k, m in super().items() if k != keep]
++        total = sum(b for _, b in resident)
++        dropped = False
++        for k, b in resident:           # dict order == least recently used first
++            if total <= self._budget:
++                break
++            if b > 0:
++                super().__delitem__(k)
++                total -= b
++                dropped = True
++        if dropped:
++            gc.collect()
++
++    def __getitem__(self, key):
++        if super().__contains__(key):
++            model = super().pop(key)    # re-insert: mark as most recently used
++            super().__setitem__(key, model)
++            return model
++        if key not in self._specs:
++            raise KeyError(key)
++        self._evict()
++        device = self._device_fn() if self._device_fn is not None else None
++        if __import__('os').environ.get('TRELLIS_LOAD_ON_GPU', '1') == '0':
++            device = None
++        model = self._loader(self._specs[key], device)
++        model.eval()
++        super().__setitem__(key, model)
++        return model
++
++    def __contains__(self, key):
++        return key in self._specs or super().__contains__(key)
++
++    def __iter__(self):
++        return iter(self.keys())
++
++    def __len__(self):
++        return len(self.keys())
++
++    def keys(self):
++        return list(dict.fromkeys(list(self._specs) + list(super().keys())))
++
++    def values(self):
++        return (self[k] for k in self.keys())
++
++    def items(self):
++        return ((k, self[k]) for k in self.keys())
++
++    def loaded(self) -> dict:
++        """Models currently in memory (no loading)."""
++        return dict(super().items())
++
++
+ class Pipeline:
+     """
+     A base class for pipelines.
+@@ -15,6 +93,8 @@ class Pipeline:
+         if models is None:
+             return
+         self.models = models
++        if isinstance(models, LazyModels):
++            return
+         for model in self.models.values():
+             model.eval()
+ 
+@@ -36,27 +116,36 @@ class Pipeline:
+         with open(config_file, 'r') as f:
+             args = json.load(f)['args']
+ 
+-        _models = {}
+-        for k, v in args['models'].items():
+-            if hasattr(cls, 'model_names_to_load') and k not in cls.model_names_to_load:
+-                continue
++        def _load(v, device=None):
+             try:
+-                _models[k] = models.from_pretrained(f"{path}/{v}")
++                return models.from_pretrained(f"{path}/{v}", device=device)
+             except Exception as e:
+-                _models[k] = models.from_pretrained(v)
++                return models.from_pretrained(v, device=device)
++
++        specs = {
++            k: v for k, v in args['models'].items()
++            if not hasattr(cls, 'model_names_to_load') or k in cls.model_names_to_load
++        }
++        if os.environ.get('TRELLIS_LAZY_LOAD', '1') != '0':
++            _models = LazyModels(specs, _load)
++        else:
++            _models = {k: _load(v) for k, v in specs.items()}
+ 
+         new_pipeline = cls(_models)
+         new_pipeline._pretrained_args = args
++        if isinstance(_models, LazyModels):
++            _models._device_fn = lambda: getattr(new_pipeline, '_device', None)
+         return new_pipeline
+ 
+     @property
+     def device(self) -> torch.device:
+         if hasattr(self, '_device'):
+             return self._device
+-        for model in self.models.values():
++        loaded = self.models.loaded() if isinstance(self.models, LazyModels) else self.models
++        for model in loaded.values():
+             if hasattr(model, 'device'):
+                 return model.device
+-        for model in self.models.values():
++        for model in loaded.values():
+             if hasattr(model, 'parameters'):
+                 return next(model.parameters()).device
+         raise RuntimeError("No device found.")
+diff --git a/trellis2/pipelines/rembg/__init__.py b/trellis2/pipelines/rembg/__init__.py
+index fc1eed1..261e231 100644
+--- a/trellis2/pipelines/rembg/__init__.py
++++ b/trellis2/pipelines/rembg/__init__.py
+@@ -1 +1,2 @@
+ from .BiRefNet import *
++from .transparent_bg import TransparentBackground, build_rembg
+diff --git a/trellis2/pipelines/trellis2_image_to_3d.py b/trellis2/pipelines/trellis2_image_to_3d.py
+index c8c4586..e2e4fa7 100644
+--- a/trellis2/pipelines/trellis2_image_to_3d.py
++++ b/trellis2/pipelines/trellis2_image_to_3d.py
+@@ -8,6 +8,7 @@ from . import samplers, rembg
+ from ..modules.sparse import SparseTensor
+ from ..modules import image_feature_extractor
+ from ..representations import Mesh, MeshWithVoxel
++from ..utils import symmetry as sym
+ 
+ 
+ class Trellis2ImageTo3DPipeline(Pipeline):
+@@ -104,7 +105,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
+         # Allow optional rembg_model for custom implementations
+         if 'rembg_model' in args and args['rembg_model'] is not None:
+-            pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
++            pipeline.rembg_model = rembg.build_rembg(args['rembg_model']['name'], args['rembg_model']['args'])
+         else:
+             pipeline.rembg_model = None
+         
+@@ -151,6 +152,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+             output = self.rembg_model(input)
+             if self.low_vram:
+                 self.rembg_model.cpu()
++                torch.cuda.empty_cache()
+         output_np = np.array(output)
+         alpha = output_np[:, :, 3]
+         bbox = np.argwhere(alpha > 0.8 * 255)
+@@ -181,6 +183,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         cond = self.image_cond_model(image)
+         if self.low_vram:
+             self.image_cond_model.cpu()
++            torch.cuda.empty_cache()
+         if not include_neg_cond:
+             return {'cond': cond}
+         neg_cond = torch.zeros_like(cond)
+@@ -195,15 +198,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         resolution: int,
+         num_samples: int = 1,
+         sampler_params: dict = {},
++        symmetry: Union[str, Sequence[int]] = (),
++        symmetry_threshold: float = sym.DEFAULT_DETECT_THRESHOLD,
+     ) -> torch.Tensor:
+         """
+         Sample sparse structures with the given conditioning.
+-        
++
+         Args:
+             cond (dict): The conditioning information.
+             resolution (int): The resolution of the sparse structure.
+             num_samples (int): The number of samples to generate.
+             sampler_params (dict): Additional parameters for the sampler.
++            symmetry: 'auto', 'off'/() or explicit axes ('x', 'xy', (0, 1), ...).
++                The detected/used axes and per-axis scores are stored in
++                self.symmetry_info.
++            symmetry_threshold (float): occupancy IoU above which 'auto' accepts an axis.
+         """
+         # Sample sparse structure latent
+         flow_model = self.models['sparse_structure_flow_model']
+@@ -223,14 +232,30 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         ).samples
+         if self.low_vram:
+             flow_model.cpu()
++            torch.cuda.empty_cache()
+         
+         # Decode sparse structure latent
+         decoder = self.models['sparse_structure_decoder']
+         if self.low_vram:
+             decoder.to(self.device)
+-        decoded = decoder(z_s)>0
++        logits = decoder(z_s)
+         if self.low_vram:
+             decoder.cpu()
++            torch.cuda.empty_cache()
++        spec = sym.parse_symmetry(symmetry)
++        scores = sym.dense_mirror_scores(logits)
++        if spec == 'auto':
++            axes = tuple(a for a in range(3) if scores[a] >= symmetry_threshold)
++        else:
++            axes = spec
++        self.symmetry_info = {
++            'mode': 'auto' if spec == 'auto' else sym.axes_to_str(spec),
++            'axes': axes,
++            'scores': {sym.AXIS_NAMES[a]: round(scores[a], 4) for a in range(3)},
++        }
++        if spec == 'auto' or axes:
++            print(f"[symmetry] occupancy mirror IoU {self.symmetry_info['scores']} -> axes '{sym.axes_to_str(axes)}'")
++        decoded = sym.dense_symmetrize(logits, axes) > 0
+         if resolution != decoded.shape[2]:
+             ratio = decoded.shape[2] // resolution
+             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
+@@ -271,6 +296,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         ).samples
+         if self.low_vram:
+             flow_model.cpu()
++            torch.cuda.empty_cache()
+ 
+         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
+         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
+@@ -289,6 +315,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         coords: torch.Tensor,
+         sampler_params: dict = {},
+         max_num_tokens: int = 49152,
++        symmetry_axes: Sequence[int] = (),
+     ) -> SparseTensor:
+         """
+         Sample structured latent with the given conditioning.
+@@ -316,6 +343,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         ).samples
+         if self.low_vram:
+             flow_model_lr.cpu()
++            torch.cuda.empty_cache()
+         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
+         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
+         slat = slat * std + mean
+@@ -324,9 +352,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         if self.low_vram:
+             self.models['shape_slat_decoder'].to(self.device)
+             self.models['shape_slat_decoder'].low_vram = True
+-        hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
++        with sym.shape_decoder_symmetry(self.models['shape_slat_decoder'], symmetry_axes, lr_resolution // 16):
++            hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
+         if self.low_vram:
+             self.models['shape_slat_decoder'].cpu()
++            torch.cuda.empty_cache()
+             self.models['shape_slat_decoder'].low_vram = False
+         hr_resolution = resolution
+         while True:
+@@ -360,6 +390,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         ).samples
+         if self.low_vram:
+             flow_model.cpu()
++            torch.cuda.empty_cache()
+ 
+         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
+         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
+@@ -371,12 +402,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         self,
+         slat: SparseTensor,
+         resolution: int,
++        symmetry_axes: Sequence[int] = (),
+     ) -> Tuple[List[Mesh], List[SparseTensor]]:
+         """
+         Decode the structured latent.
+ 
+         Args:
+             slat (SparseTensor): The structured latent.
++            symmetry_axes: mirror axes; symmetrises subdivision and dual-grid outputs.
+ 
+         Returns:
+             List[Mesh]: The decoded meshes.
+@@ -386,9 +419,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         if self.low_vram:
+             self.models['shape_slat_decoder'].to(self.device)
+             self.models['shape_slat_decoder'].low_vram = True
+-        ret = self.models['shape_slat_decoder'](slat, return_subs=True)
++        with sym.shape_decoder_symmetry(self.models['shape_slat_decoder'], symmetry_axes, resolution // 16, resolution):
++            ret = self.models['shape_slat_decoder'](slat, return_subs=True)
+         if self.low_vram:
+             self.models['shape_slat_decoder'].cpu()
++            torch.cuda.empty_cache()
+             self.models['shape_slat_decoder'].low_vram = False
+         return ret
+     
+@@ -428,6 +463,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         ).samples
+         if self.low_vram:
+             flow_model.cpu()
++            torch.cuda.empty_cache()
+ 
+         std = torch.tensor(self.tex_slat_normalization['std'])[None].to(slat.device)
+         mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(slat.device)
+@@ -451,9 +487,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         """
+         if self.low_vram:
+             self.models['tex_slat_decoder'].to(self.device)
++            self.models['tex_slat_decoder'].low_vram = True
+         ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
+         if self.low_vram:
+             self.models['tex_slat_decoder'].cpu()
++            torch.cuda.empty_cache()
++            self.models['tex_slat_decoder'].low_vram = False
+         return ret
+     
+     @torch.no_grad()
+@@ -462,6 +501,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         shape_slat: SparseTensor,
+         tex_slat: SparseTensor,
+         resolution: int,
++        symmetry_axes: Sequence[int] = (),
++        tex_gate: Tuple[float, float] = sym.DEFAULT_TEX_GATE,
+     ) -> List[MeshWithVoxel]:
+         """
+         Decode the latent codes.
+@@ -470,23 +511,34 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+             shape_slat (SparseTensor): The structured latent for shape.
+             tex_slat (SparseTensor): The structured latent for texture.
+             resolution (int): The resolution of the output.
++            symmetry_axes: mirror axes (0=x, 1=y, 2=z) to enforce on geometry and,
++                gated by disagreement, on the PBR attributes.
++            tex_gate: (lo, hi) attribute difference below which both sides are
++                averaged / above which each side keeps its own value.
++
++        Each returned mesh carries `mesh.symmetry` = {'axes', 'tex_asym'} where
++        tex_asym is, per axis, the fraction of mirrored voxel pairs left asymmetric.
+         """
+-        meshes, subs = self.decode_shape_slat(shape_slat, resolution)
++        symmetry_axes = tuple(symmetry_axes)
++        meshes, subs = self.decode_shape_slat(shape_slat, resolution, symmetry_axes)
+         tex_voxels = self.decode_tex_slat(tex_slat, subs)
+         out_mesh = []
+         for m, v in zip(meshes, tex_voxels):
+             m.fill_holes()
+-            out_mesh.append(
+-                MeshWithVoxel(
+-                    m.vertices, m.faces,
+-                    origin = [-0.5, -0.5, -0.5],
+-                    voxel_size = 1 / resolution,
+-                    coords = v.coords[:, 1:],
+-                    attrs = v.feats,
+-                    voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
+-                    layout=self.pbr_attr_layout
+-                )
++            attrs, tex_asym = v.feats, {}
++            if symmetry_axes:
++                attrs, tex_asym = sym.symmetrize_attrs(v.coords, v.feats, symmetry_axes, resolution, tex_gate)
++            out = MeshWithVoxel(
++                m.vertices, m.faces,
++                origin = [-0.5, -0.5, -0.5],
++                voxel_size = 1 / resolution,
++                coords = v.coords[:, 1:],
++                attrs = attrs,
++                voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
++                layout=self.pbr_attr_layout
+             )
++            out.symmetry = {'axes': symmetry_axes, 'tex_asym': tex_asym}
++            out_mesh.append(out)
+         return out_mesh
+     
+     @torch.no_grad()
+@@ -502,6 +554,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         return_latent: bool = False,
+         pipeline_type: Optional[str] = None,
+         max_num_tokens: int = 49152,
++        symmetry: Union[str, Sequence[int]] = 'off',
++        symmetry_threshold: float = sym.DEFAULT_DETECT_THRESHOLD,
++        tex_gate: Tuple[float, float] = sym.DEFAULT_TEX_GATE,
+     ) -> List[MeshWithVoxel]:
+         """
+         Run the pipeline.
+@@ -517,6 +572,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+             return_latent (bool): Whether to return the latent codes.
+             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
+             max_num_tokens (int): The maximum number of tokens to use.
++            symmetry: 'off' (default), 'auto' (detect mirror planes from the sparse
++                structure) or explicit axes such as 'x', 'xy', (0, 1). Axes are the
++                grid-centre planes; z is up. The result is in self.symmetry_info and
++                on each mesh as mesh.symmetry.
++            symmetry_threshold (float): detection threshold for 'auto'.
++            tex_gate (tuple): see decode_latent.
+         """
+         # Check pipeline type
+         pipeline_type = pipeline_type or self.default_pipeline_type
+@@ -545,8 +606,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+         coords = self.sample_sparse_structure(
+             cond_512, ss_res,
+-            num_samples, sparse_structure_sampler_params
++            num_samples, sparse_structure_sampler_params,
++            symmetry=symmetry, symmetry_threshold=symmetry_threshold,
+         )
++        sym_axes = self.symmetry_info['axes']
+         if pipeline_type == '512':
+             shape_slat = self.sample_shape_slat(
+                 cond_512, self.models['shape_slat_flow_model_512'],
+@@ -573,7 +636,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+                 self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                 512, 1024,
+                 coords, shape_slat_sampler_params,
+-                max_num_tokens
++                max_num_tokens, symmetry_axes=sym_axes,
+             )
+             tex_slat = self.sample_tex_slat(
+                 cond_1024, self.models['tex_slat_flow_model_1024'],
+@@ -585,14 +648,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+                 self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                 512, 1536,
+                 coords, shape_slat_sampler_params,
+-                max_num_tokens
++                max_num_tokens, symmetry_axes=sym_axes,
+             )
+             tex_slat = self.sample_tex_slat(
+                 cond_1024, self.models['tex_slat_flow_model_1024'],
+                 shape_slat, tex_slat_sampler_params
+             )
+         torch.cuda.empty_cache()
+-        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
++        out_mesh = self.decode_latent(shape_slat, tex_slat, res, sym_axes, tex_gate)
++        for m in out_mesh:
++            m.symmetry['scores'] = self.symmetry_info['scores']
++            m.symmetry['mode'] = self.symmetry_info['mode']
+         if return_latent:
+             return out_mesh, (shape_slat, tex_slat, res)
+         else:
+diff --git a/trellis2/pipelines/trellis2_texturing.py b/trellis2/pipelines/trellis2_texturing.py
+index c184b5e..6c560d8 100755
+--- a/trellis2/pipelines/trellis2_texturing.py
++++ b/trellis2/pipelines/trellis2_texturing.py
+@@ -83,7 +83,7 @@ class Trellis2TexturingPipeline(Pipeline):
+         pipeline.tex_slat_normalization = args['tex_slat_normalization']
+ 
+         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
+-        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
++        pipeline.rembg_model = rembg.build_rembg(args['rembg_model']['name'], args['rembg_model']['args'])
+ 
+         pipeline.low_vram = args.get('low_vram', True)
+         pipeline.pbr_attr_layout = {
+diff --git a/trellis2/utils/render_utils.py b/trellis2/utils/render_utils.py
+index d6fb3e9..613ef4f 100644
+--- a/trellis2/utils/render_utils.py
++++ b/trellis2/utils/render_utils.py
+@@ -127,3 +127,33 @@ def make_pbr_vis_frames(result, resolution=1024):
+         frame = np.concatenate([row1, row2], axis=0)
+         frames.append(frame)
+     return frames
++
++
++def load_hdri(path: str) -> np.ndarray:
++    """
++    Read an .exr environment map as linear float32 RGB (H, W, 3).
++
++    Not every OpenCV wheel is built with OpenEXR (cv2.imread then returns
++    None), so fall back to the OpenEXR bindings. imageio is no substitute: its
++    ffmpeg reader tone-maps the file to uint8.
++    """
++    import os
++    os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
++    import cv2
++    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
++    if img is not None:
++        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
++    try:
++        import OpenEXR, Imath
++    except ImportError as e:
++        raise RuntimeError(
++            f"Cannot read {path}: this OpenCV build has no OpenEXR support and the "
++            f"OpenEXR python package is missing (pip install OpenEXR)."
++        ) from e
++    f = OpenEXR.InputFile(path)
++    dw = f.header()['dataWindow']
++    w, h = dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1
++    pt = Imath.PixelType(Imath.PixelType.FLOAT)
++    chans = [np.frombuffer(f.channel(c, pt), dtype=np.float32).reshape(h, w) for c in 'RGB']
++    f.close()
++    return np.ascontiguousarray(np.stack(chans, axis=-1))
+diff --git a/run_amd.sh b/run_amd.sh
+new file mode 100755
+index 0000000..dba8124
+--- /dev/null
++++ b/run_amd.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++# Run TRELLIS.2 on the AMD RX 7900 XTX (ROCm) with the repo venv
++# (.venv sits on top of the py310_amd conda env, see README.md).
++#
++#   ./run_amd.sh example.py
++#   ./run_amd.sh app.py
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++PY="${TRELLIS_PYTHON:-$HERE/.venv/bin/python}"
++
++# ~/.local carries an old ROCm torch that would shadow the env's torch.
++export PYTHONNOUSERSITE=1
++export TRITON_DEFAULT_BACKEND="${TRITON_DEFAULT_BACKEND:-amd}"
++export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
++# expandable_segments corrupts tensors on this ROCm stack.
++unset PYTORCH_ALLOC_CONF PYTORCH_HIP_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF
++# Shell debug defaults that only add noise / fill /tmp with comgr temp files.
++unset TORCH_LOGS AMD_COMGR_SAVE_TEMPS AMD_COMGR_EMIT_VERBOSE_LOGS
++export AMD_LOG_LEVEL=0
++export OPENCV_IO_ENABLE_OPENEXR=1
++
++cd "$HERE"
++exec "$PY" "$@"
+diff --git a/patches/nvdiffrast-hip-rocm-fixes.patch b/patches/nvdiffrast-hip-rocm-fixes.patch
+new file mode 100644
+index 0000000..f7e3d87
+--- /dev/null
++++ b/patches/nvdiffrast-hip-rocm-fixes.patch
+@@ -0,0 +1,227 @@
++--- a/setup.py
+++++ b/setup.py
++@@ -80,10 +80,12 @@
++ if IS_HIP:
++     # HIP/ROCm build flags
++     extra_compile_args = {
++-        "cxx": ["-DNVDR_TORCH", "-D__HIP_PLATFORM_AMD__"],
+++        "cxx": ["-DNVDR_TORCH", "-D__HIP_PLATFORM_AMD__", "-Wno-c++11-narrowing"],
++         "nvcc": [  # hipcc still uses 'nvcc' key in CUDAExtension
++             "-DNVDR_TORCH",
+++        ] + [f for f in os.environ.get("NVDR_HIP_EXTRA_FLAGS", "").split() if f] + [
++             "-D__HIP_PLATFORM_AMD__",
+++            "-Wno-c++11-narrowing",
++         ],
++     }
++ else:
++--- a/csrc/common/hipraster/impl/Util.inl
+++++ b/csrc/common/hipraster/impl/Util.inl
++@@ -24,14 +24,21 @@
++   return ((S64)(U32)hi << 32) | (U32)lo;
++ }
++ 
++-// Lane mask functions - HIP provides these
++-__device__ __inline__ U32 getLaneMaskLt(void) { return __lanemask_lt(); }
+++// Lane mask functions. These must be pure lane-index masks like CUDA's
+++// %lanemask_*: HIP's __lanemask_lt() is ANDed with the *currently active*
+++// lanes, which under divergence (e.g. the per-bin emission loop in BinRaster)
+++// skips lower lanes and makes two lanes write the same output slot.
+++__device__ __inline__ U32 getLaneMaskLt(void) {
+++  return (U32)((1ull << __lane_id()) - 1);
+++}
++ __device__ __inline__ U32 getLaneMaskLe(void) {
+++  // 64-bit shift: (1u << 32) on lane 31 is a shift by 0 on AMD, which made
+++  // the mask 0 instead of 0xFFFFFFFF and broke the coarse-raster prefix sum.
++   int lane = __lane_id();
++-  return (1u << (lane + 1)) - 1;
+++  return (U32)((2ull << lane) - 1);
++ }
++ __device__ __inline__ U32 getLaneMaskGt(void) { return ~getLaneMaskLe(); }
++-__device__ __inline__ U32 getLaneMaskGe(void) { return ~__lanemask_lt(); }
+++__device__ __inline__ U32 getLaneMaskGe(void) { return ~getLaneMaskLt(); }
++ 
++ // Bit operations - use HIP/standard functions
++ __device__ __inline__ int findLeadingOne(U32 v) {
++--- a/csrc/common/hipraster/impl/CoarseRaster.inl
+++++ b/csrc/common/hipraster/impl/CoarseRaster.inl
++@@ -44,8 +44,14 @@
++   volatile S32& s_triQueueWritePos = smem.triQueueWritePos;
++   volatile U32& s_binStreamSelectedOfs = smem.binStreamSelectedOfs;
++   volatile U32& s_binStreamSelectedSize = smem.binStreamSelectedSize;
+++#if CR_COARSE_EMIT_IN_LDS
+++  (void)gscratch;
+++  volatile U32 (&s_warpEmitMask)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = smem.warpEmitMask;
+++  volatile U32 (&s_warpEmitPrefixSum)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = smem.warpEmitPrefixSum;
+++#else
++   volatile U32 (&s_warpEmitMask)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = gscratch->warpEmitMask;
++   volatile U32 (&s_warpEmitPrefixSum)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = gscratch->warpEmitPrefixSum;
+++#endif
++   volatile U32 (&s_tileEmitPrefixSum)[CR_BIN_SQR + 1] = smem.tileEmitPrefixSum;
++   volatile U32 (&s_tileAllocPrefixSum)[CR_BIN_SQR + 1] = smem.tileAllocPrefixSum;
++   volatile S32 (&s_tileStreamCurrOfs)[CR_BIN_SQR] = smem.tileStreamCurrOfs;
++@@ -217,31 +223,31 @@
++ #if (CR_BIN_STREAMS_SIZE > 1)
++             v[0] = t;
++             __syncwarp(hasStreamMask);
++-            t = ::min(t, v[-1]);
+++            t = ::min(t, (threadIdx.x >= 1) ? (U32)v[-1] : ~0u);
++             __syncwarp(hasStreamMask);
++ #endif
++ #if (CR_BIN_STREAMS_SIZE > 2)
++             v[0] = t;
++             __syncwarp(hasStreamMask);
++-            t = ::min(t, v[-2]);
+++            t = ::min(t, (threadIdx.x >= 2) ? (U32)v[-2] : ~0u);
++             __syncwarp(hasStreamMask);
++ #endif
++ #if (CR_BIN_STREAMS_SIZE > 4)
++             v[0] = t;
++             __syncwarp(hasStreamMask);
++-            t = ::min(t, v[-4]);
+++            t = ::min(t, (threadIdx.x >= 4) ? (U32)v[-4] : ~0u);
++             __syncwarp(hasStreamMask);
++ #endif
++ #if (CR_BIN_STREAMS_SIZE > 8)
++             v[0] = t;
++             __syncwarp(hasStreamMask);
++-            t = ::min(t, v[-8]);
+++            t = ::min(t, (threadIdx.x >= 8) ? (U32)v[-8] : ~0u);
++             __syncwarp(hasStreamMask);
++ #endif
++ #if (CR_BIN_STREAMS_SIZE > 16)
++             v[0] = t;
++             __syncwarp(hasStreamMask);
++-            t = ::min(t, v[-16]);
+++            t = ::min(t, (threadIdx.x >= 16) ? (U32)v[-16] : ~0u);
++             __syncwarp(hasStreamMask);
++ #endif
++             v[0] = t;
++--- a/csrc/common/hipraster/impl/PrivateDefs.hpp
+++++ b/csrc/common/hipraster/impl/PrivateDefs.hpp
++@@ -164,6 +164,10 @@
++ // doesn't sum both allocations (AMD RDNA3 2-kernel workaround).
++ //------------------------------------------------------------------------
++ 
+++#ifndef CR_COARSE_EMIT_IN_LDS
+++#define CR_COARSE_EMIT_IN_LDS 1
+++#endif
+++
++ struct CoarseSmem
++ {
++     volatile S32 oobCount;
++@@ -183,6 +187,12 @@
++     volatile S32 tileStreamCurrOfs[CR_BIN_SQR];
++     volatile U32 firstAllocSeg;
++     volatile U32 firstActiveIdx;
+++#if CR_COARSE_EMIT_IN_LDS
+++    // Back in LDS (as in upstream nvdiffrast). Must stay adjacent and in this
+++    // order: "Find warp in tile" walks from warpEmitMask into warpEmitPrefixSum.
+++    volatile U32 warpEmitMask[CR_COARSE_WARPS][CR_BIN_SQR + 1];
+++    volatile U32 warpEmitPrefixSum[CR_COARSE_WARPS][CR_BIN_SQR + 1];
+++#endif
++ };
++ 
++ // Per-block global scratch: holds the formerly-shared arrays that don't fit in
++--- a/csrc/common/hipraster/impl/RasterImpl.cpp
+++++ b/csrc/common/hipraster/impl/RasterImpl.cpp
++@@ -1,3 +1,4 @@
+++#include <cstdlib>
++ // !!! This is a file automatically generated by hipify!!!
++ #include "hip/hip_runtime.h"
++ // Copyright (c) 2009-2022, NVIDIA CORPORATION.  All rights reserved.
++@@ -14,6 +15,9 @@
++ #include "../../hipraster/impl/RasterImpl.hpp"
++ #include <hip/hip_runtime.h>
++ #include <iostream>
+++#include <vector>
+++#include <string>
+++#include <cstdio>
++ #include <unistd.h>
++ 
++ using namespace CR;
++@@ -79,7 +83,7 @@
++   int maxSmemPerBlock = 0;
++   NVDR_CHECK_CUDA_ERROR(hipDeviceGetAttribute(
++       &maxSmemPerBlock, hipDeviceAttributeMaxSharedMemoryPerBlock, currentDevice));
++-  std::cerr << "[RasterImpl ctor @" << (void*)this << "] dev=" << currentDevice
+++  if (getenv("NVDR_HIP_VERBOSE")) std::cerr << "[RasterImpl ctor @" << (void*)this << "] dev=" << currentDevice
++             << " maxSmemPerBlock=" << maxSmemPerBlock
++             << " SMs=" << m_numSMs
++             << " coarseBlocks=" << m_numCoarseBlocksPerSM
++@@ -264,9 +268,33 @@
++ 
++     // Diagnostic: log atomics on first few draws per instance, and always when zero output.
++     m_drawCount++;
+++    if (const char* dumpDir = getenv("NVDR_HIP_DUMP")) {
+++      // Debug: dump intermediate raster buffers (image 0 layout, raw bytes).
+++      NVDR_CHECK_CUDA_ERROR(hipStreamSynchronize(stream));
+++      auto dump = [&](const char* name, Buffer& b) {
+++        std::vector<char> h(b.getSize());
+++        if (!h.empty())
+++          NVDR_CHECK_CUDA_ERROR(hipMemcpy(h.data(), b.getPtr(), h.size(), hipMemcpyDeviceToHost));
+++        std::string fn = std::string(dumpDir) + "/" + name + ".bin";
+++        FILE* f = fopen(fn.c_str(), "wb");
+++        if (f) { fwrite(h.data(), 1, h.size(), f); fclose(f); }
+++      };
+++      dump("triHeader", m_triHeader); dump("triSubtris", m_triSubtris);
+++      dump("binFirstSeg", m_binFirstSeg); dump("binTotal", m_binTotal);
+++      dump("binSegData", m_binSegData); dump("binSegNext", m_binSegNext); dump("binSegCount", m_binSegCount);
+++      dump("tileFirstSeg", m_tileFirstSeg); dump("tileSegData", m_tileSegData);
+++      dump("tileSegNext", m_tileSegNext); dump("tileSegCount", m_tileSegCount);
+++      dump("activeTiles", m_activeTiles);
+++      std::string fn = std::string(dumpDir) + "/atomics.bin";
+++      FILE* f = fopen(fn.c_str(), "wb");
+++      if (f) { fwrite(m_crAtomicsHost.getPtr(), sizeof(CRAtomics), m_numImages, f); fclose(f); }
+++      std::cerr << "[NVDR_HIP_DUMP] maxSubtris=" << m_maxSubtris << " maxBinSegs=" << m_maxBinSegs
+++                << " maxTileSegs=" << m_maxTileSegs << " binsX=" << m_sizeBins.x << " tilesX=" << m_sizeTiles.x
+++                << " sizeofAtomics=" << sizeof(CRAtomics) << std::endl;
+++    }
++     for (int i = 0; i < m_numImages; i++) {
++       const CRAtomics &a = atomics[i];
++-      if (m_drawCount <= 3 || a.numActiveTiles == 0) {
+++      if (getenv("NVDR_HIP_VERBOSE") && (m_drawCount <= 3 || a.numActiveTiles == 0)) {
++         std::cerr << "[drawTriangles @" << (void*)this
++                   << " #" << m_drawCount << " img" << i << "] "
++                   << "subtris=" << a.numSubtris
++@@ -341,7 +369,12 @@
++                                          m_numImages * sizeof(CRAtomics),
++                                          hipMemcpyHostToDevice, stream));
++   } else if (stageSet == 2) {
++-    // Peel: upload atomics without reinit.
+++    // Peel: upload atomics without reinit. Upstream reads them back right after
+++    // the coarse stage; here they are read back after the fine stage, so the
+++    // fine work counter must be rewound or every fine block exits at once
+++    // (each peel layer then just repeated the previous one).
+++    for (int i = 0; i < m_numImages; i++)
+++      atomics[i].fineCounter = 0;
++     NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(m_crAtomics.getPtr(), atomics,
++                                          m_numImages * sizeof(CRAtomics),
++                                          hipMemcpyHostToDevice, stream));
++--- a/csrc/common/hipraster/impl/RasterImpl_kernel.hip
+++++ b/csrc/common/hipraster/impl/RasterImpl_kernel.hip
++@@ -17,7 +17,15 @@
++ // actually waits for all wave threads to converge, matching the original
++ // NVIDIA __syncwarp() semantics. The mask argument is ignored (AMD waves work
++ // at the wavefront level; partial-wave masks aren't a primitive).
++-#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
+++// A wave barrier alone is only a scheduling barrier and does not order memory,
+++// so LDS writes before it were not guaranteed visible to other lanes after it.
+++// Fence on both sides (wavefront scope), like HIP's own __syncwarp.
+++#define __syncwarp(...)                                       \
+++  do {                                                        \
+++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");    \
+++    __builtin_amdgcn_wave_barrier();                          \
+++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");    \
+++  } while (0)
++ #endif
++ 
++ // Copyright (c) 2009-2022, NVIDIA CORPORATION.  All rights reserved.
++@@ -79,6 +87,8 @@
++     // 32KB gives coarseBlocks=2 (occupancy 2 blocks/SM) and PASSES.
++     // Threshold is the 32KB / 64KB-per-SM split, not the kernel size itself.
++     __shared__ char s_smem[32768];
+++    static_assert(sizeof(CR::CoarseSmem) <= sizeof(s_smem), "CoarseSmem does not fit");
+++    static_assert(sizeof(CR::FineSmem) <= sizeof(s_smem), "FineSmem does not fit");
++     if (stage == 0) CR::coarseRasterImpl(*p, s_smem);
++     else            CR::fineRasterImpl(*p, s_smem);
++ }
+diff --git a/trellis2/utils/symmetry.py b/trellis2/utils/symmetry.py
+new file mode 100644
+index 0000000..ccdfae3
+--- /dev/null
++++ b/trellis2/utils/symmetry.py
+@@ -0,0 +1,262 @@
++"""
++Mirror-symmetry support for the TRELLIS.2 image-to-3D pipeline.
++
++All mirrors are about the grid centre plane of one of the three axes
++(voxel i -> R-1-i). That plane stays consistent through every level of the
++pipeline: the 64^3 sparse structure, the 32/64 latent grid, the decoder's 2x
++subdivisions up to 512/1024/1536 and the cascade's re-quantisation, so a
++symmetric coarse structure stays symmetric all the way down.
++
++What is symmetrised (no retraining, everything is post-hoc on decoder outputs):
++  1. sparse-structure occupancy logits (dense 64^3)          -> symmetric token set
++  2. subdivision logits of every shape-decoder upsample block -> symmetric voxel set
++  3. the 7 flexible-dual-grid output channels                 -> exactly symmetric mesh
++  4. PBR voxel attributes, gated by disagreement              -> keeps logos / text
++Mirrored UVs for the GLB export live in `trellis2.utils.symmetry_glb`.
++
++Axes are pipeline/voxel axes: 0 = x, 1 = y, 2 = z (z is up; GLB y = z).
++"""
++from contextlib import contextmanager
++from typing import *
++import torch
++
++AXIS_NAMES = 'xyz'
++
++# Shell IoU of the 64^3 occupancy with its mirror; above this an axis counts as
++# symmetric in 'auto' mode. Calibrated on the 72 assets/example_image inputs
++# (tests_amd/sym_calibrate.py, 2026-11-20): clearly mirror-symmetric objects score
++# 0.80-1.00, posed characters / plants / dioramas 0.05-0.60; 0.75-0.79 held
++# borderline cases (roaring bear, mech with one gun arm), so 0.80 favours precision.
++DEFAULT_DETECT_THRESHOLD = 0.80
++
++# Texture gate: per-voxel max |a - mirror(a)| over base colour / metallic /
++# roughness. Below `lo` both sides are averaged, above `hi` they are kept.
++DEFAULT_TEX_GATE = (0.08, 0.20)
++
++
++# ----------------------------------------------------------------------------
++# Spec parsing
++# ----------------------------------------------------------------------------
++
++def parse_symmetry(spec: Union[None, str, Sequence[int]]) -> Union[str, Tuple[int, ...]]:
++    """
++    'off' / None / '' -> ()      'auto' -> 'auto'
++    'x', 'xy', 'x,z', [0, 2]     -> sorted tuple of axis indices
++    """
++    if spec is None:
++        return ()
++    if isinstance(spec, str):
++        s = spec.strip().lower()
++        if s in ('', 'off', 'none', 'false', '0'):
++            return ()
++        if s == 'auto':
++            return 'auto'
++        axes = []
++        for ch in s.replace(',', '').replace(' ', ''):
++            if ch not in AXIS_NAMES:
++                raise ValueError(f"Invalid symmetry spec {spec!r}: use 'off', 'auto' or axes from 'xyz'")
++            axes.append(AXIS_NAMES.index(ch))
++        return tuple(sorted(set(axes)))
++    axes = tuple(sorted(set(int(a) for a in spec)))
++    if any(a not in (0, 1, 2) for a in axes):
++        raise ValueError(f"Invalid symmetry axes {spec!r}")
++    return axes
++
++
++def axes_to_str(axes: Sequence[int]) -> str:
++    return ''.join(AXIS_NAMES[a] for a in axes) or 'off'
++
++
++# ----------------------------------------------------------------------------
++# Dense (sparse-structure) stage
++# ----------------------------------------------------------------------------
++
++@torch.no_grad()
++def dense_mirror_scores(logits: torch.Tensor) -> List[float]:
++    """
++    Shell IoU of occupancy (logits > 0) with its grid-centre mirror, per axis.
++    logits: [B, 1, R, R, R]; the score is the minimum over the batch.
++    """
++    occ = logits > 0
++    scores = []
++    for a in range(3):
++        m = occ.flip(2 + a)
++        inter = (occ & m).flatten(1).sum(1).float()
++        union = (occ | m).flatten(1).sum(1).float().clamp(min=1)
++        scores.append((inter / union).min().item())
++    return scores
++
++
++def dense_symmetrize(logits: torch.Tensor, axes: Sequence[int]) -> torch.Tensor:
++    for a in axes:
++        logits = 0.5 * (logits + logits.flip(2 + a))
++    return logits
++
++
++# ----------------------------------------------------------------------------
++# Sparse coordinate lookup
++# ----------------------------------------------------------------------------
++
++class CoordIndex:
++    """Sorted int64 keys of [N, 4] (batch, x, y, z) coords for O(log N) lookup."""
++
++    def __init__(self, coords: torch.Tensor, R: int):
++        self.R = R
++        keys = self.key(coords)
++        self.sorted_keys, self.order = torch.sort(keys)
++
++    def key(self, coords: torch.Tensor) -> torch.Tensor:
++        c = coords.long()
++        R = self.R
++        return ((c[:, 0] * R + c[:, 1]) * R + c[:, 2]) * R + c[:, 3]
++
++    def lookup(self, coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        """Returns (index into the original coords, found mask)."""
++        q = self.key(coords)
++        pos = torch.searchsorted(self.sorted_keys, q).clamp(max=self.sorted_keys.numel() - 1)
++        found = self.sorted_keys[pos] == q
++        # out-of-range queries (mirror with shift may leave the grid)
++        inb = ((coords[:, 1:] >= 0) & (coords[:, 1:] < self.R)).all(dim=1)
++        found = found & inb
++        return self.order[pos], found
++
++
++def mirror_coords(coords: torch.Tensor, axis: int, R: int, shift: int = 0) -> torch.Tensor:
++    """Voxel i -> R-1-shift-i on `axis` (coords are [N, 4] with batch first)."""
++    out = coords.clone()
++    out[:, 1 + axis] = R - 1 - shift - out[:, 1 + axis]
++    return out
++
++
++def _mirror_partner(coords: torch.Tensor, axis: int, R: int, shift: int = 0, index: CoordIndex = None):
++    index = index or CoordIndex(coords, R)
++    return index.lookup(mirror_coords(coords, axis, R, shift))
++
++
++# ----------------------------------------------------------------------------
++# Decoder hooks: subdivision logits and flexible-dual-grid outputs
++# ----------------------------------------------------------------------------
++
++def _child_perm(axis: int, device) -> torch.Tensor:
++    # child index bit i = offset on axis i (see SparseUpsample / SparseChannel2Spatial)
++    return torch.arange(8, device=device) ^ (1 << axis)
++
++
++def symmetrize_subdiv(coords: torch.Tensor, logits: torch.Tensor, axes: Sequence[int], R: int) -> torch.Tensor:
++    """Average each voxel's 8 child logits with the mirrored voxel's mirrored children."""
++    feats = logits.float()
++    index = CoordIndex(coords, R)
++    for a in axes:
++        idx, found = _mirror_partner(coords, a, R, index=index)
++        partner = feats[idx][:, _child_perm(a, feats.device)]
++        feats = torch.where(found[:, None], 0.5 * (feats + partner), feats)
++    return feats.to(logits.dtype)
++
++
++def symmetrize_dual_grid(coords: torch.Tensor, h: torch.Tensor, axes: Sequence[int], R: int) -> torch.Tensor:
++    """
++    Symmetrise the raw 7-channel FlexiDualGrid decoder output.
++
++      0:3  dual vertex, v = (1+2m)*sigmoid(f) - m in voxel-local [0,1] -> mirror v' = 1-v, i.e. f' = -f
++      3:6  'intersected' logit for the primal edge along axis k owned by the voxel.
++           The edge along the mirror axis maps to the mirrored voxel (R-1-i); edges along the
++           other two axes sit on the voxel's max face and map to voxel R-2-i.
++      6    quad split weight (per voxel scalar)
++
++    Voxels whose partner is missing keep their own value.
++    """
++    feats = h.float()
++    index = CoordIndex(coords, R)
++    for a in axes:
++        idx0, found0 = _mirror_partner(coords, a, R, 0, index)
++        idx1, found1 = _mirror_partner(coords, a, R, 1, index)
++        p0 = feats[idx0]
++        p1 = feats[idx1]
++        mirrored = p0.clone()
++        mirrored[:, a] = -p0[:, a]
++        use = found0[:, None].expand_as(feats).clone()
++        for k in range(3):
++            if k != a:
++                mirrored[:, 3 + k] = p1[:, 3 + k]
++                use[:, 3 + k] = found1
++        feats = torch.where(use, 0.5 * (feats + mirrored), feats)
++    return feats.to(h.dtype)
++
++
++@contextmanager
++def shape_decoder_symmetry(decoder, axes: Sequence[int], base_res: int, final_res: Optional[int] = None):
++    """
++    While active, symmetrise the shape decoder's subdivision logits (all upsample blocks)
++    and, if `final_res` is given, its 7-channel output.
++
++    base_res: grid resolution of the latent fed to the decoder (resolution // 16).
++    """
++    handles = []
++    if axes:
++        n_levels = len(decoder.blocks)
++        for i in range(n_levels - 1):
++            up = decoder.blocks[i][-1]
++            if not hasattr(up, 'to_subdiv'):
++                continue
++            R = base_res * 2 ** i
++
++            def hook(module, inputs, output, R=R):
++                return output.replace(symmetrize_subdiv(output.coords, output.feats, axes, R))
++            handles.append(up.to_subdiv.register_forward_hook(hook))
++        if final_res is not None:
++            def out_hook(module, inputs, output):
++                return output.replace(symmetrize_dual_grid(output.coords, output.feats, axes, final_res))
++            handles.append(decoder.output_layer.register_forward_hook(out_hook))
++    try:
++        yield
++    finally:
++        for h in handles:
++            h.remove()
++
++
++# ----------------------------------------------------------------------------
++# PBR attributes
++# ----------------------------------------------------------------------------
++
++@torch.no_grad()
++def symmetrize_attrs(
++    coords: torch.Tensor,
++    attrs: torch.Tensor,
++    axes: Sequence[int],
++    R: int,
++    gate: Tuple[float, float] = DEFAULT_TEX_GATE,
++    gate_channels: slice = slice(0, 5),
++) -> Tuple[torch.Tensor, Dict[str, float]]:
++    """
++    Gated average of per-voxel attributes with their mirror partner.
++    Returns new attrs and per-axis stats {axis: fraction of matched voxels kept asymmetric}.
++    """
++    lo, hi = gate
++    feats = attrs.float()
++    index = CoordIndex(coords, R)
++    stats = {}
++    for a in axes:
++        idx, found = _mirror_partner(coords, a, R, index=index)
++        partner = feats[idx]
++        d = (feats[:, gate_channels] - partner[:, gate_channels]).abs().amax(dim=1)
++        w = ((hi - d) / (hi - lo)).clamp(0, 1) * found.float()
++        feats = feats + 0.5 * w[:, None] * (partner - feats)
++        n = found.sum().clamp(min=1).float()
++        stats[AXIS_NAMES[a]] = ((w < 0.5) & found).sum().float().div(n).item()
++    return feats.to(attrs.dtype), stats
++
++
++# ----------------------------------------------------------------------------
++# Diagnostics
++# ----------------------------------------------------------------------------
++
++@torch.no_grad()
++def sparse_mirror_iou(coords: torch.Tensor, R: int) -> List[float]:
++    """IoU of a sparse voxel set ([N,4] coords) with its grid-centre mirror, per axis."""
++    index = CoordIndex(coords, R)
++    out = []
++    for a in range(3):
++        _, found = _mirror_partner(coords, a, R, index=index)
++        hit = found.sum().item()
++        out.append(hit / max(1, 2 * coords.shape[0] - hit))
++    return out
+diff --git a/trellis2/utils/symmetry_glb.py b/trellis2/utils/symmetry_glb.py
+new file mode 100644
+index 0000000..118bd15
+--- /dev/null
++++ b/trellis2/utils/symmetry_glb.py
+@@ -0,0 +1,322 @@
++"""
++GLB export with mirrored UVs for symmetric meshes.
++
++Same cleaning / remeshing / baking as `o_voxel.postprocess.to_glb`, but the mesh is
++cut at each mirror plane (grid-centre planes, coordinate 0 in [-0.5, 0.5]^3), only
++the kept half (or quarter) is UV-unwrapped and baked, and the result is mirrored
++back with shared UVs. Effects:
++  - the exported mesh is exactly symmetric (vertices, faces and UVs),
++  - each mirror axis doubles the texel area per surface for the same texture size,
++  - no UV seam along the mirror plane (plane vertices are shared by both halves).
++
++Asymmetric texture details (logos, text) are taken from the kept (+axis) side and
++mirrored, so only use this when the PBR volume is symmetric; see
++`choose_uv_mirror_axes`.
++"""
++from typing import *
++import numpy as np
++import torch
++import cv2
++from PIL import Image
++import trimesh
++import trimesh.visual
++
++from .symmetry import AXIS_NAMES
++
++# Max fraction of mirrored voxel pairs that the texture gate left asymmetric for an
++# axis to still get mirrored UVs in 'auto' mode. Measured 2026-11-20 at 512: the
++# steampunk T 2.6-3.3 % (nothing worth keeping), white armour 9 % (side-specific trim).
++DEFAULT_UV_ASYM_LIMIT = 0.05
++
++
++def choose_uv_mirror_axes(symmetry: Optional[dict], limit: float = DEFAULT_UV_ASYM_LIMIT) -> Tuple[int, ...]:
++    """Axes from mesh.symmetry whose texture is (nearly) symmetric."""
++    if not symmetry or not symmetry.get('axes'):
++        return ()
++    asym = symmetry.get('tex_asym', {})
++    return tuple(a for a in symmetry['axes'] if asym.get(AXIS_NAMES[a], 1.0) <= limit)
++
++
++def _cut(v: np.ndarray, f: np.ndarray, axis: int, eps: float) -> Tuple[np.ndarray, np.ndarray]:
++    """
++    Keep the part with coordinate[axis] >= 0. Crossing triangles are clipped
++    (Sutherland-Hodgman); each cut edge gets exactly one new vertex, shared by both
++    adjacent faces, so the cut adds no cracks. Faces lying in the plane are dropped
++    (their mirror image would duplicate them).
++    """
++    v = np.asarray(v, dtype=np.float64).copy()
++    f = np.asarray(f, dtype=np.int64)
++    d = v[:, axis]
++    d[np.abs(d) < eps] = 0.0
++    s = np.sign(d)[f]
++    keep = (s >= 0).all(1) & (s > 0).any(1)
++    cross = (s > 0).any(1) & (s < 0).any(1)
++    tris = [f[keep]]
++    edge_pt, new_v = {}, []
++    clipped = []
++    for face in f[cross].tolist():
++        poly = []
++        for k in range(3):
++            i, j = face[k], face[(k + 1) % 3]
++            if d[i] >= 0:
++                poly.append(i)
++            if d[i] * d[j] < 0:
++                key = (i, j) if i < j else (j, i)
++                if key not in edge_pt:
++                    lo, hi = key
++                    t = d[lo] / (d[lo] - d[hi])
++                    p = v[lo] + t * (v[hi] - v[lo])
++                    p[axis] = 0.0
++                    edge_pt[key] = v.shape[0] + len(new_v)
++                    new_v.append(p)
++                poly.append(edge_pt[key])
++        for k in range(1, len(poly) - 1):
++            clipped.append((poly[0], poly[k], poly[k + 1]))
++    if clipped:
++        tris.append(np.asarray(clipped, dtype=np.int64))
++    if new_v:
++        v = np.concatenate([v, np.asarray(new_v)])
++    f = np.concatenate(tris)
++    used = np.zeros(v.shape[0], dtype=bool)
++    used[f.reshape(-1)] = True
++    remap = np.cumsum(used) - 1
++    return v[used].astype(np.float32), remap[f]
++
++
++def _mirror_back(v, f, uv, n, axis):
++    """Append the mirror image; plane vertices (coord == 0) are shared, not duplicated."""
++    N = v.shape[0]
++    on = v[:, axis] == 0
++    n = n.clone()
++    n[on, axis] = 0
++    n = torch.nn.functional.normalize(n, dim=1)
++    v2 = v.clone(); v2[:, axis] = -v2[:, axis]
++    n2 = n.clone(); n2[:, axis] = -n2[:, axis]
++    remap = torch.arange(2 * N, device=v.device)
++    on_idx = on.nonzero().squeeze(1)
++    remap[N + on_idx] = on_idx
++    f2 = remap[f[:, [0, 2, 1]].long() + N]
++    V = torch.cat([v, v2]); UV = torch.cat([uv, uv]); NN = torch.cat([n, n2])
++    F = torch.cat([f.long(), f2])
++    used = torch.zeros(2 * N, dtype=torch.bool, device=v.device)
++    used[F.reshape(-1)] = True
++    new_idx = torch.cumsum(used.long(), 0) - 1
++    return V[used], new_idx[F].int(), UV[used], NN[used]
++
++
++def to_glb_mirrored(
++    vertices: torch.Tensor,
++    faces: torch.Tensor,
++    attr_volume: torch.Tensor,
++    coords: torch.Tensor,
++    attr_layout: Dict[str, slice],
++    aabb: Union[list, tuple, np.ndarray, torch.Tensor],
++    mirror_axes: Sequence[int],
++    voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
++    grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
++    decimation_target: int = 1000000,
++    texture_size: int = 2048,
++    remesh: bool = False,
++    remesh_band: float = 1,
++    remesh_project: float = 0.9,
++    mesh_cluster_threshold_cone_half_angle_rad=np.radians(90.0),
++    mesh_cluster_refine_iterations=0,
++    mesh_cluster_global_iterations=1,
++    mesh_cluster_smooth_strength=1,
++    verbose: bool = False,
++    use_tqdm: bool = False,
++):
++    """
++    Like o_voxel.postprocess.to_glb, plus `mirror_axes` (0=x, 1=y, 2=z in pipeline
++    coordinates). With no axes it simply calls to_glb.
++    """
++    import o_voxel
++    mirror_axes = tuple(sorted(set(mirror_axes)))
++    common = dict(
++        vertices=vertices, faces=faces, attr_volume=attr_volume, coords=coords,
++        attr_layout=attr_layout, aabb=aabb, voxel_size=voxel_size, grid_size=grid_size,
++        decimation_target=decimation_target, texture_size=texture_size, remesh=remesh,
++        remesh_band=remesh_band, remesh_project=remesh_project,
++        mesh_cluster_threshold_cone_half_angle_rad=mesh_cluster_threshold_cone_half_angle_rad,
++        mesh_cluster_refine_iterations=mesh_cluster_refine_iterations,
++        mesh_cluster_global_iterations=mesh_cluster_global_iterations,
++        mesh_cluster_smooth_strength=mesh_cluster_smooth_strength,
++        verbose=verbose, use_tqdm=use_tqdm,
++    )
++    if not mirror_axes:
++        return o_voxel.postprocess.to_glb(**common)
++
++    import cumesh
++    import nvdiffrast.torch as dr
++    from flex_gemm.ops.grid_sample import grid_sample_3d
++    from tqdm import tqdm
++
++    # --- Input normalisation (as in to_glb) ---
++    if isinstance(aabb, (list, tuple)):
++        aabb = np.array(aabb)
++    if isinstance(aabb, np.ndarray):
++        aabb = torch.tensor(aabb, dtype=torch.float32, device=coords.device)
++    if voxel_size is not None:
++        if isinstance(voxel_size, float):
++            voxel_size = [voxel_size] * 3
++        if isinstance(voxel_size, (list, tuple)):
++            voxel_size = np.array(voxel_size)
++        if isinstance(voxel_size, np.ndarray):
++            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=coords.device)
++        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
++    else:
++        assert grid_size is not None, "Either voxel_size or grid_size must be provided"
++        if isinstance(grid_size, int):
++            grid_size = [grid_size] * 3
++        if isinstance(grid_size, (list, tuple)):
++            grid_size = np.array(grid_size)
++        if isinstance(grid_size, np.ndarray):
++            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=coords.device)
++        voxel_size = (aabb[1] - aabb[0]) / grid_size
++    centre = aabb.mean(dim=0)
++    assert centre.abs().max().item() < 1e-6, "mirrored export expects an AABB centred at the origin"
++
++    pbar = tqdm(total=6, desc="Extracting GLB (mirrored UVs)") if use_tqdm else None
++    step = lambda desc: (pbar.set_description(desc), pbar.update(1)) if pbar else None
++    log = print if verbose else (lambda *a, **k: None)
++
++    # --- Cleaning, remeshing / simplification (as in to_glb) ---
++    vertices = vertices.cuda(); faces = faces.cuda()
++    mesh = cumesh.CuMesh()
++    mesh.init(vertices, faces)
++    mesh.fill_holes(max_hole_perimeter=3e-2)
++    vertices, faces = mesh.read()
++    bvh = cumesh.cuBVH(vertices, faces)
++    step("Cleaning mesh")
++    if not remesh:
++        mesh.simplify(decimation_target * 3, verbose=verbose)
++        mesh.remove_duplicate_faces()
++        mesh.repair_non_manifold_edges()
++        mesh.remove_small_connected_components(1e-5)
++        mesh.fill_holes(max_hole_perimeter=3e-2)
++        mesh.simplify(decimation_target, verbose=verbose)
++        mesh.remove_duplicate_faces()
++        mesh.repair_non_manifold_edges()
++        mesh.remove_small_connected_components(1e-5)
++        mesh.fill_holes(max_hole_perimeter=3e-2)
++        mesh.unify_face_orientations()
++    else:
++        scale = (aabb[1] - aabb[0]).max().item()
++        resolution = grid_size.max().item()
++        mesh.init(*cumesh.remeshing.remesh_narrow_band_dc(
++            vertices, faces,
++            center=centre,
++            scale=(resolution + 3 * remesh_band) / resolution * scale,
++            resolution=resolution,
++            band=remesh_band,
++            project_back=remesh_project,
++            verbose=verbose,
++            bvh=bvh,
++        ))
++        mesh.simplify(decimation_target, verbose=verbose)
++    log(f"Full mesh before cutting: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
++    step("Cutting at mirror planes")
++
++    # --- Cut to the fundamental domain ---
++    v_np, f_np = [t.cpu().numpy() for t in mesh.read()]
++    eps = 1e-6
++    for a in mirror_axes:
++        v_np, f_np = _cut(v_np, f_np.astype(np.int64), a, eps)
++        log(f"Cut at {AXIS_NAMES[a]}=0: {v_np.shape[0]} vertices, {f_np.shape[0]} faces")
++    if f_np.shape[0] == 0:
++        log("Mirror cut left no faces, falling back to plain export")
++        if pbar: pbar.close()
++        return o_voxel.postprocess.to_glb(**common)
++
++    half = cumesh.CuMesh()
++    half.init(torch.from_numpy(v_np).cuda(), torch.from_numpy(f_np).int().cuda())
++    step("Parameterizing half mesh")
++    out_vertices, out_faces, out_uvs, out_vmaps = half.uv_unwrap(
++        compute_charts_kwargs={
++            "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
++            "refine_iterations": mesh_cluster_refine_iterations,
++            "global_iterations": mesh_cluster_global_iterations,
++            "smooth_strength": mesh_cluster_smooth_strength,
++        },
++        return_vmaps=True,
++        verbose=verbose,
++    )
++    out_vertices = out_vertices.cuda(); out_faces = out_faces.cuda()
++    out_uvs = out_uvs.cuda(); out_vmaps = out_vmaps.cuda()
++    half.compute_vertex_normals()
++    out_normals = half.read_vertex_normals()[out_vmaps]
++    # unwrap copies positions, so plane vertices are still exactly 0; re-snap anyway
++    for a in mirror_axes:
++        out_vertices[out_vertices[:, a].abs() < eps, a] = 0.0
++
++    # --- Bake the half's texture (identical to to_glb) ---
++    step("Sampling attributes")
++    ctx = dr.RasterizeCudaContext()
++    uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
++    rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
++    for i in range(0, out_faces.shape[0], 100000):
++        rast_chunk, _ = dr.rasterize(ctx, uvs_rast, out_faces[i:i + 100000], resolution=[texture_size, texture_size])
++        mask_chunk = rast_chunk[..., 3:4] > 0
++        rast_chunk[..., 3:4] += i
++        rast = torch.where(mask_chunk, rast_chunk, rast)
++    mask = rast[0, ..., 3] > 0
++    pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
++    valid_pos = pos[mask]
++    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
++    orig_tri_verts = vertices[faces[face_id.long()]]
++    valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
++    attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
++    attrs[mask] = grid_sample_3d(
++        attr_volume,
++        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
++        shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
++        grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
++        mode='trilinear',
++    )
++
++    # --- Mirror geometry back (reverse order of the cuts) ---
++    step("Mirroring")
++    V, F, UV, NN = out_vertices, out_faces, out_uvs, out_normals
++    for a in reversed(mirror_axes):
++        V, F, UV, NN = _mirror_back(V, F, UV, NN, a)
++    log(f"Mirrored mesh: {V.shape[0]} vertices, {F.shape[0]} faces "
++        f"(texel area x{2 ** len(mirror_axes)} per surface)")
++
++    # --- Texture post-processing & material (as in to_glb) ---
++    step("Finalizing mesh")
++    mask = mask.cpu().numpy()
++    base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
++    metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
++    roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
++    alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
++    mask_inv = (~mask).astype(np.uint8)
++    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
++    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
++    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
++    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
++    material = trimesh.visual.material.PBRMaterial(
++        baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
++        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
++        metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=-1)),
++        metallicFactor=1.0,
++        roughnessFactor=1.0,
++        alphaMode='OPAQUE',
++        doubleSided=True if not remesh else False,
++    )
++    vertices_np = V.cpu().numpy()
++    faces_np = F.cpu().numpy()
++    uvs_np = UV.cpu().numpy()
++    normals_np = NN.cpu().numpy()
++    vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
++    normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2], -normals_np[:, 1]
++    uvs_np[:, 1] = 1 - uvs_np[:, 1]
++    textured_mesh = trimesh.Trimesh(
++        vertices=vertices_np,
++        faces=faces_np,
++        vertex_normals=normals_np,
++        process=False,
++        visual=trimesh.visual.TextureVisuals(uv=uvs_np, material=material),
++    )
++    if pbar:
++        pbar.update(1); pbar.close()
++    return textured_mesh
+diff --git a/trellis2/pipelines/rembg/transparent_bg.py b/trellis2/pipelines/rembg/transparent_bg.py
+new file mode 100644
+index 0000000..743c4c8
+--- /dev/null
++++ b/trellis2/pipelines/rembg/transparent_bg.py
+@@ -0,0 +1,58 @@
++from typing import *
++import os
++from PIL import Image
++
++
++class TransparentBackground:
++    """
++    Background removal with InSPyReNet (the `transparent-background` package).
++
++    Ungated replacement for briaai/RMBG-2.0. The network is loaded on first
++    use, so pipelines that only ever see RGBA inputs never pay for it.
++    """
++    def __init__(self, mode: str = 'base', **kwargs):
++        self.mode = mode
++        self.device = 'cpu'
++        self.remover = None
++
++    def _load(self):
++        if self.remover is None:
++            from transparent_background import Remover
++            self.remover = Remover(mode=self.mode, jit=False, device=str(self.device))
++        return self.remover
++
++    def to(self, device):
++        self.device = device
++        if self.remover is not None:
++            self.remover.model.to(device)
++            self.remover.device = str(device)
++
++    def cuda(self):
++        self.to('cuda')
++
++    def cpu(self):
++        self.to('cpu')
++
++    def __call__(self, image: Image.Image) -> Image.Image:
++        return self._load().process(image.convert('RGB'), type='rgba')
++
++
++def build_rembg(name: str, args: dict):
++    """
++    Build the background remover named in pipeline.json.
++
++    TRELLIS_REMBG=transparent_background | birefnet | auto (default).
++    `auto` uses the configured model when it can be loaded and falls back to
++    transparent-background otherwise (RMBG-2.0 is a gated repository).
++    """
++    from . import BiRefNet
++    choice = os.environ.get('TRELLIS_REMBG', 'auto').lower()
++    if choice in ('transparent_background', 'transparent-background', 'inspyrenet'):
++        return TransparentBackground()
++    if choice == 'birefnet':
++        return BiRefNet(**args)
++    try:
++        return {'BiRefNet': BiRefNet, 'TransparentBackground': TransparentBackground}[name](**args)
++    except Exception as e:
++        print(f"[REMBG] {name}({args}) unavailable ({type(e).__name__}); using transparent-background instead.")
++        return TransparentBackground()
