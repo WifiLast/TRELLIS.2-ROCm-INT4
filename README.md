@@ -11,22 +11,26 @@ PyTorch 2.14 rocm7.2 wheels) and on an NVIDIA Turing GPU (sm_75, CUDA 12.8, PyTo
 
 ## Examples
 
-512 pipeline, seed 42, front view: shaded render and normal map (geometry) of the generated GLB.
+512 pipeline, seed 42, front view of the generated GLB. Inputs: [T.png](assets/example_image/T.png),
+[bear](assets/example_image/5c80e5e03a3b60b6f03eaf555ba1dafc0e4230c472d7e8c8e2c5ca0a0dfcef10.webp).
 
 ```bash
-./generate.sh --image assets/example_image/T.png
+./generate.sh --image assets/example_image/T.png            # right
+./generate.sh --image assets/example_image/T.png --stock    # left
 ```
 
-![T: input, stock, INT4 + INT8 on AMD and NVIDIA](assets/readme/example_T.jpg)
+![T: stock vs INT4 + INT8](assets/readme/T_stock_vs_int.jpg)
+
+![T: AMD vs NVIDIA](assets/readme/T_amd_vs_nvidia.jpg)
 
 ```bash
 ./generate.sh --image assets/example_image/5c80e5e03a3b60b6f03eaf555ba1dafc0e4230c472d7e8c8e2c5ca0a0dfcef10.webp
 ```
 
-![Bear: input, stock, INT4 + INT8 on AMD](assets/readme/example_bear.jpg)
+![Bear: stock vs INT4 + INT8](assets/readme/bear_stock_vs_int.jpg)
 
-"stock" is `--stock` (the unmodified bf16 / fp16 models). The NVIDIA run (Turing, fp16 DiTs, SDPA) used
-`--sampler '{"ss":{"steps":6},"shape":{"steps":6},"tex":{"steps":6}}'` instead of the default 12 steps.
+The NVIDIA run (Turing, fp16 DiTs, SDPA) used `--sampler '{"ss":{"steps":6},"shape":{"steps":6},"tex":{"steps":6}}'`
+instead of the default 12 steps.
 
 ## Results (RX 7900 XTX, seed 42, T.png / bear / gear example images)
 
