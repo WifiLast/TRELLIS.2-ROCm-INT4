@@ -29,6 +29,9 @@ PyTorch 2.14 rocm7.2 wheels) and on an NVIDIA Turing GPU (sm_75, CUDA 12.8, PyTo
 
 ![Bear: stock vs INT4 + INT8](assets/readme/bear_stock_vs_int.jpg)
 
+Interactive 3D (geometry only, opens in GitHub's STL viewer): [stock](assets/readme/bear_stock.stl) ·
+[INT4 + INT8](assets/readme/bear_int4.stl)
+
 The NVIDIA run (Turing, fp16 DiTs, SDPA) used `--sampler '{"ss":{"steps":6},"shape":{"steps":6},"tex":{"steps":6}}'`
 instead of the default 12 steps.
 
