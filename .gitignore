@@ -1,4 +1,20 @@
+# outputs, local model files
+outputs/
 runs/
+/model
 *.zip
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+# environment and the third-party sources setup.sh clones / builds
+.venv/
+nvdiffrast-hip/
+nvdiffrec/
+CuMesh/
+FlexGEMM/
+o-voxel-hip/
+o-voxel/third_party/eigen/
+nvdiffrast/
+o-voxel-cuda/

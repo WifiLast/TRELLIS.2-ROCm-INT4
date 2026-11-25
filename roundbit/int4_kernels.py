@@ -1,11 +1,11 @@
-"""Real INT4 weight-only matmul (W4A16) for RoundBit's IntLinear packed format, in Triton.
+"""Real INT4 weight-only matmul (W4A16) for the packed RoundBit DiT layers, in Triton.
 
-Weight format (IntLinear.packed_state_dict): Qp uint8 (N, K/2), two codes per byte, low nibble = even column,
+Weight format (packed DiT files, see int_layer.py): Qp uint8 (N, K/2), two codes per byte, low nibble = even column,
 high nibble = odd column, value = q + 8 (q in [-8, 7]); scales fp16 (N, K/group). W[n, k] = (nib - 8) * s[n, k//group].
 
     y = int4_linear(x, Qp, s, group, bias)        x (..., K) fp16/bf16 -> (..., N) in x's dtype
 
-Two paths, picked by M = rows of x (crossover measured per GPU, see bench in tests/ and ROUNDBIT_INT4_FUSED_MAX_M):
+Two paths, picked by M = rows of x (crossover measured on a 7900 XTX; on other GPUs, override with ROUNDBIT_INT4_FUSED_MAX_M):
   fused   (M <= fused_max_m): one kernel reads the packed codes, unpacks + scales them in registers and feeds
           tl.dot (fp32 accumulate). Memory-bound small-M shapes read 4x fewer weight bytes than fp16.
   dequant (larger M): one kernel unpacks the whole layer to a temporary fp16/bf16 weight, then torch.matmul

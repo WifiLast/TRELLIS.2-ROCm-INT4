@@ -1,0 +1,227 @@
+--- a/setup.py
++++ b/setup.py
+@@ -80,10 +80,12 @@
+ if IS_HIP:
+     # HIP/ROCm build flags
+     extra_compile_args = {
+-        "cxx": ["-DNVDR_TORCH", "-D__HIP_PLATFORM_AMD__"],
++        "cxx": ["-DNVDR_TORCH", "-D__HIP_PLATFORM_AMD__", "-Wno-c++11-narrowing"],
+         "nvcc": [  # hipcc still uses 'nvcc' key in CUDAExtension
+             "-DNVDR_TORCH",
++        ] + [f for f in os.environ.get("NVDR_HIP_EXTRA_FLAGS", "").split() if f] + [
+             "-D__HIP_PLATFORM_AMD__",
++            "-Wno-c++11-narrowing",
+         ],
+     }
+ else:
+--- a/csrc/common/hipraster/impl/Util.inl
++++ b/csrc/common/hipraster/impl/Util.inl
+@@ -24,14 +24,21 @@
+   return ((S64)(U32)hi << 32) | (U32)lo;
+ }
+ 
+-// Lane mask functions - HIP provides these
+-__device__ __inline__ U32 getLaneMaskLt(void) { return __lanemask_lt(); }
++// Lane mask functions. These must be pure lane-index masks like CUDA's
++// %lanemask_*: HIP's __lanemask_lt() is ANDed with the *currently active*
++// lanes, which under divergence (e.g. the per-bin emission loop in BinRaster)
++// skips lower lanes and makes two lanes write the same output slot.
++__device__ __inline__ U32 getLaneMaskLt(void) {
++  return (U32)((1ull << __lane_id()) - 1);
++}
+ __device__ __inline__ U32 getLaneMaskLe(void) {
++  // 64-bit shift: (1u << 32) on lane 31 is a shift by 0 on AMD, which made
++  // the mask 0 instead of 0xFFFFFFFF and broke the coarse-raster prefix sum.
+   int lane = __lane_id();
+-  return (1u << (lane + 1)) - 1;
++  return (U32)((2ull << lane) - 1);
+ }
+ __device__ __inline__ U32 getLaneMaskGt(void) { return ~getLaneMaskLe(); }
+-__device__ __inline__ U32 getLaneMaskGe(void) { return ~__lanemask_lt(); }
++__device__ __inline__ U32 getLaneMaskGe(void) { return ~getLaneMaskLt(); }
+ 
+ // Bit operations - use HIP/standard functions
+ __device__ __inline__ int findLeadingOne(U32 v) {
+--- a/csrc/common/hipraster/impl/CoarseRaster.inl
++++ b/csrc/common/hipraster/impl/CoarseRaster.inl
+@@ -44,8 +44,14 @@
+   volatile S32& s_triQueueWritePos = smem.triQueueWritePos;
+   volatile U32& s_binStreamSelectedOfs = smem.binStreamSelectedOfs;
+   volatile U32& s_binStreamSelectedSize = smem.binStreamSelectedSize;
++#if CR_COARSE_EMIT_IN_LDS
++  (void)gscratch;
++  volatile U32 (&s_warpEmitMask)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = smem.warpEmitMask;
++  volatile U32 (&s_warpEmitPrefixSum)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = smem.warpEmitPrefixSum;
++#else
+   volatile U32 (&s_warpEmitMask)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = gscratch->warpEmitMask;
+   volatile U32 (&s_warpEmitPrefixSum)[CR_COARSE_WARPS][CR_BIN_SQR + 1] = gscratch->warpEmitPrefixSum;
++#endif
+   volatile U32 (&s_tileEmitPrefixSum)[CR_BIN_SQR + 1] = smem.tileEmitPrefixSum;
+   volatile U32 (&s_tileAllocPrefixSum)[CR_BIN_SQR + 1] = smem.tileAllocPrefixSum;
+   volatile S32 (&s_tileStreamCurrOfs)[CR_BIN_SQR] = smem.tileStreamCurrOfs;
+@@ -217,31 +223,31 @@
+ #if (CR_BIN_STREAMS_SIZE > 1)
+             v[0] = t;
+             __syncwarp(hasStreamMask);
+-            t = ::min(t, v[-1]);
++            t = ::min(t, (threadIdx.x >= 1) ? (U32)v[-1] : ~0u);
+             __syncwarp(hasStreamMask);
+ #endif
+ #if (CR_BIN_STREAMS_SIZE > 2)
+             v[0] = t;
+             __syncwarp(hasStreamMask);
+-            t = ::min(t, v[-2]);
++            t = ::min(t, (threadIdx.x >= 2) ? (U32)v[-2] : ~0u);
+             __syncwarp(hasStreamMask);
+ #endif
+ #if (CR_BIN_STREAMS_SIZE > 4)
+             v[0] = t;
+             __syncwarp(hasStreamMask);
+-            t = ::min(t, v[-4]);
++            t = ::min(t, (threadIdx.x >= 4) ? (U32)v[-4] : ~0u);
+             __syncwarp(hasStreamMask);
+ #endif
+ #if (CR_BIN_STREAMS_SIZE > 8)
+             v[0] = t;
+             __syncwarp(hasStreamMask);
+-            t = ::min(t, v[-8]);
++            t = ::min(t, (threadIdx.x >= 8) ? (U32)v[-8] : ~0u);
+             __syncwarp(hasStreamMask);
+ #endif
+ #if (CR_BIN_STREAMS_SIZE > 16)
+             v[0] = t;
+             __syncwarp(hasStreamMask);
+-            t = ::min(t, v[-16]);
++            t = ::min(t, (threadIdx.x >= 16) ? (U32)v[-16] : ~0u);
+             __syncwarp(hasStreamMask);
+ #endif
+             v[0] = t;
+--- a/csrc/common/hipraster/impl/PrivateDefs.hpp
++++ b/csrc/common/hipraster/impl/PrivateDefs.hpp
+@@ -164,6 +164,10 @@
+ // doesn't sum both allocations (AMD RDNA3 2-kernel workaround).
+ //------------------------------------------------------------------------
+ 
++#ifndef CR_COARSE_EMIT_IN_LDS
++#define CR_COARSE_EMIT_IN_LDS 1
++#endif
++
+ struct CoarseSmem
+ {
+     volatile S32 oobCount;
+@@ -183,6 +187,12 @@
+     volatile S32 tileStreamCurrOfs[CR_BIN_SQR];
+     volatile U32 firstAllocSeg;
+     volatile U32 firstActiveIdx;
++#if CR_COARSE_EMIT_IN_LDS
++    // Back in LDS (as in upstream nvdiffrast). Must stay adjacent and in this
++    // order: "Find warp in tile" walks from warpEmitMask into warpEmitPrefixSum.
++    volatile U32 warpEmitMask[CR_COARSE_WARPS][CR_BIN_SQR + 1];
++    volatile U32 warpEmitPrefixSum[CR_COARSE_WARPS][CR_BIN_SQR + 1];
++#endif
+ };
+ 
+ // Per-block global scratch: holds the formerly-shared arrays that don't fit in
+--- a/csrc/common/hipraster/impl/RasterImpl.cpp
++++ b/csrc/common/hipraster/impl/RasterImpl.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // !!! This is a file automatically generated by hipify!!!
+ #include "hip/hip_runtime.h"
+ // Copyright (c) 2009-2022, NVIDIA CORPORATION.  All rights reserved.
+@@ -14,6 +15,9 @@
+ #include "../../hipraster/impl/RasterImpl.hpp"
+ #include <hip/hip_runtime.h>
+ #include <iostream>
++#include <vector>
++#include <string>
++#include <cstdio>
+ #include <unistd.h>
+ 
+ using namespace CR;
+@@ -79,7 +83,7 @@
+   int maxSmemPerBlock = 0;
+   NVDR_CHECK_CUDA_ERROR(hipDeviceGetAttribute(
+       &maxSmemPerBlock, hipDeviceAttributeMaxSharedMemoryPerBlock, currentDevice));
+-  std::cerr << "[RasterImpl ctor @" << (void*)this << "] dev=" << currentDevice
++  if (getenv("NVDR_HIP_VERBOSE")) std::cerr << "[RasterImpl ctor @" << (void*)this << "] dev=" << currentDevice
+             << " maxSmemPerBlock=" << maxSmemPerBlock
+             << " SMs=" << m_numSMs
+             << " coarseBlocks=" << m_numCoarseBlocksPerSM
+@@ -264,9 +268,33 @@
+ 
+     // Diagnostic: log atomics on first few draws per instance, and always when zero output.
+     m_drawCount++;
++    if (const char* dumpDir = getenv("NVDR_HIP_DUMP")) {
++      // Debug: dump intermediate raster buffers (image 0 layout, raw bytes).
++      NVDR_CHECK_CUDA_ERROR(hipStreamSynchronize(stream));
++      auto dump = [&](const char* name, Buffer& b) {
++        std::vector<char> h(b.getSize());
++        if (!h.empty())
++          NVDR_CHECK_CUDA_ERROR(hipMemcpy(h.data(), b.getPtr(), h.size(), hipMemcpyDeviceToHost));
++        std::string fn = std::string(dumpDir) + "/" + name + ".bin";
++        FILE* f = fopen(fn.c_str(), "wb");
++        if (f) { fwrite(h.data(), 1, h.size(), f); fclose(f); }
++      };
++      dump("triHeader", m_triHeader); dump("triSubtris", m_triSubtris);
++      dump("binFirstSeg", m_binFirstSeg); dump("binTotal", m_binTotal);
++      dump("binSegData", m_binSegData); dump("binSegNext", m_binSegNext); dump("binSegCount", m_binSegCount);
++      dump("tileFirstSeg", m_tileFirstSeg); dump("tileSegData", m_tileSegData);
++      dump("tileSegNext", m_tileSegNext); dump("tileSegCount", m_tileSegCount);
++      dump("activeTiles", m_activeTiles);
++      std::string fn = std::string(dumpDir) + "/atomics.bin";
++      FILE* f = fopen(fn.c_str(), "wb");
++      if (f) { fwrite(m_crAtomicsHost.getPtr(), sizeof(CRAtomics), m_numImages, f); fclose(f); }
++      std::cerr << "[NVDR_HIP_DUMP] maxSubtris=" << m_maxSubtris << " maxBinSegs=" << m_maxBinSegs
++                << " maxTileSegs=" << m_maxTileSegs << " binsX=" << m_sizeBins.x << " tilesX=" << m_sizeTiles.x
++                << " sizeofAtomics=" << sizeof(CRAtomics) << std::endl;
++    }
+     for (int i = 0; i < m_numImages; i++) {
+       const CRAtomics &a = atomics[i];
+-      if (m_drawCount <= 3 || a.numActiveTiles == 0) {
++      if (getenv("NVDR_HIP_VERBOSE") && (m_drawCount <= 3 || a.numActiveTiles == 0)) {
+         std::cerr << "[drawTriangles @" << (void*)this
+                   << " #" << m_drawCount << " img" << i << "] "
+                   << "subtris=" << a.numSubtris
+@@ -341,7 +369,12 @@
+                                          m_numImages * sizeof(CRAtomics),
+                                          hipMemcpyHostToDevice, stream));
+   } else if (stageSet == 2) {
+-    // Peel: upload atomics without reinit.
++    // Peel: upload atomics without reinit. Upstream reads them back right after
++    // the coarse stage; here they are read back after the fine stage, so the
++    // fine work counter must be rewound or every fine block exits at once
++    // (each peel layer then just repeated the previous one).
++    for (int i = 0; i < m_numImages; i++)
++      atomics[i].fineCounter = 0;
+     NVDR_CHECK_CUDA_ERROR(hipMemcpyAsync(m_crAtomics.getPtr(), atomics,
+                                          m_numImages * sizeof(CRAtomics),
+                                          hipMemcpyHostToDevice, stream));
+--- a/csrc/common/hipraster/impl/RasterImpl_kernel.hip
++++ b/csrc/common/hipraster/impl/RasterImpl_kernel.hip
+@@ -17,7 +17,15 @@
+ // actually waits for all wave threads to converge, matching the original
+ // NVIDIA __syncwarp() semantics. The mask argument is ignored (AMD waves work
+ // at the wavefront level; partial-wave masks aren't a primitive).
+-#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
++// A wave barrier alone is only a scheduling barrier and does not order memory,
++// so LDS writes before it were not guaranteed visible to other lanes after it.
++// Fence on both sides (wavefront scope), like HIP's own __syncwarp.
++#define __syncwarp(...)                                       \
++  do {                                                        \
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");    \
++    __builtin_amdgcn_wave_barrier();                          \
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");    \
++  } while (0)
+ #endif
+ 
+ // Copyright (c) 2009-2022, NVIDIA CORPORATION.  All rights reserved.
+@@ -79,6 +87,8 @@
+     // 32KB gives coarseBlocks=2 (occupancy 2 blocks/SM) and PASSES.
+     // Threshold is the 32KB / 64KB-per-SM split, not the kernel size itself.
+     __shared__ char s_smem[32768];
++    static_assert(sizeof(CR::CoarseSmem) <= sizeof(s_smem), "CoarseSmem does not fit");
++    static_assert(sizeof(CR::FineSmem) <= sizeof(s_smem), "FineSmem does not fit");
+     if (stage == 0) CR::coarseRasterImpl(*p, s_smem);
+     else            CR::fineRasterImpl(*p, s_smem);
+ }

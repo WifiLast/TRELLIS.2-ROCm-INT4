@@ -1,10 +1,14 @@
 # TRELLIS.2-ROCm-INT4
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (image to 3D) on an AMD RX 7900 XTX with calibrated
-**INT4 flow DiTs** and **INT8 latent decoders**, made with RoundBit (block-wise AutoRound-style calibration).
-This repository holds the code; the model files are not included (see [Models](#models)).
+Image to 3D with [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) on AMD (ROCm) and NVIDIA (CUDA) GPUs, using
+calibrated **INT4 flow DiTs** and **INT8 latent decoders** (RoundBit, block-wise AutoRound-style calibration). The
+repository is self-contained: it includes the TRELLIS.2 code (with low-VRAM loading) and the INT runtime. Only the
+model weights are downloaded, from Hugging Face.
 
-## Results (seed 42, T.png / bear / gear example images)
+Developed and measured on an AMD RX 7900 XTX. The NVIDIA path follows microsoft/TRELLIS.2's own CUDA setup and uses the
+same code (the INT4 kernels are Triton, which runs on both); it has not been tested on NVIDIA hardware yet.
+
+## Results (RX 7900 XTX, seed 42, T.png / bear / gear example images)
 
 | | weights the pipeline loads | peak VRAM | quality |
 |---|---|---|---|
@@ -20,27 +24,38 @@ against the source image; chamfer distance (~0.004) does not show missing or inv
 
 ## Setup
 
-1. TRELLIS.2-ROCm at the upstream commit in `patches/UPSTREAM_COMMIT`, plus the patch from this repo:
-   ```bash
-   git clone https://github.com/Mateusz-Dera/TRELLIS.2-ROCm.git ~/3d_gen/TRELLIS.2-ROCm
-   cd ~/3d_gen/TRELLIS.2-ROCm
-   git checkout aa1528a607b22c0a320848fef61b0e2fc9c9b39c
-   git apply /path/to/TRELLIS.2-ROCm-INT4/patches/trellis2-rocm-roundbit.patch
-   ```
-   The patch adds what the INT models need and what this setup was tested with: building models on the meta device
-   with load hooks (`trellis2/models/__init__.py`, `META_HOOKS`: quantized layers are swapped in before the bf16 /
-   fp16 weights are allocated), lazy model loading + low-VRAM mode (`trellis2/pipelines/base.py`,
-   `trellis2_image_to_3d.py`), the transformers 5 fix for DINOv3, a rembg fallback, symmetry support, `run_amd.sh`
-   and the nvdiffrast-hip RDNA3 fixes used by `setup.sh`.
-2. Build the environment as the TRELLIS.2-ROCm README describes (`setup.sh`, `.venv`); `run_amd.sh` uses
-   `.venv/bin/python` (override with `TRELLIS_PYTHON`). Triton is needed for the INT4 kernels.
-3. Point this repo at the checkout if it is not `~/3d_gen/TRELLIS.2-ROCm`: `export TRELLIS2_DIR=/path/to/it`.
+Linux, [uv](https://docs.astral.sh/uv/), `git`, `libjpeg-dev`, and for your GPU:
 
-## Models
+- **AMD:** ROCm and HIPIFY of the same version (tested: RX 7900 XTX). Set the GPU architecture first:
+  ```bash
+  export ROCM_PATH=/opt/rocm
+  export HSA_OVERRIDE_GFX_VERSION=11.0.0   # RX 7900 XTX
+  export TARGET_GFX=gfx1100
+  export PYTORCH_ROCM_ARCH=gfx1100
+  ```
+- **NVIDIA:** a CUDA Toolkit (`nvcc`) whose major version matches the PyTorch wheel (default: CUDA 12.8 wheels;
+  pick another with `TORCH_INDEX_URL`, e.g. `https://download.pytorch.org/whl/cu124`). With several toolkits
+  installed, set `CUDA_HOME`. GPUs without flash-attn support (before Ampere): install `xformers` into `.venv` and set `ATTN_BACKEND=xformers`.
 
-`t1.zip` (~4 GB) unpacked into `runs/trellis2/`, so that `runs/trellis2/t1/` contains:
+```bash
+./setup.sh            # detects the platform (nvidia-smi / rocminfo); force with --cuda or --rocm
+```
 
-| file | used by | size |
+`setup.sh` creates `.venv` (Python 3.11, PyTorch, flash-attn, Triton) and builds the native extensions nvdiffrast,
+nvdiffrec, CuMesh, FlexGEMM and `o-voxel/` (from this repo). On NVIDIA they build unchanged; on AMD they are
+converted with hipify and patched (nvdiffrast-hip with the RDNA3 rasterizer fixes in `patches/`). It downloads
+those sources while it runs; afterwards nothing besides the models is fetched.
+
+Models (downloaded on first use into the Hugging Face cache):
+
+- the INT files from the model repo in `RB_MODEL_REPO` (default `JustAnotherUser1/TRELLIS.2-ROCm-INT4`)
+- `microsoft/TRELLIS.2-4B`: the INT files replace only the quantized linear layers; norms, embeddings, the
+  sparse-structure decoder and the DINOv3 image encoder come from the original checkpoints
+- the DINOv3 encoder (`facebook/dinov3-vitl16-pretrain-lvd1689m`) and RMBG-2.0 are gated: accept their licences
+  on Hugging Face and log in (`hf auth login`). Without access to RMBG-2.0 the background removal falls back to
+  `transparent-background`.
+
+| INT file | used by | size |
 |---|---|---|
 | `sparse_structure_flow_model.pt` | 512, 1024_cascade | 678 MB |
 | `shape_slat_flow_model_512.pt` | 512, 1024_cascade | 678 MB |
@@ -49,39 +64,50 @@ against the source image; chamfer distance (~0.004) does not show missing or inv
 | `tex_slat_flow_model_1024.pt` | 1024_cascade | 678 MB |
 | `shape_slat_decoder.int8.pt`, `tex_slat_decoder.int8.pt` | both | 482 MB each |
 
-They are RoundBit's packed format (INT codes + fp16 group scales), not `.safetensors`: each file replaces only the
-quantized linear layers; everything else (norms, embeddings, the sparse-structure decoder, the DINOv3 image encoder)
-still comes from the original `microsoft/TRELLIS.2-4B` checkpoints in the Hugging Face cache, so those are needed too.
-The decoder files can be rebuilt from the original decoders with `./rb.sh save_dec --tag t1`.
+Only the files the chosen pipeline needs are downloaded. `--models_dir DIR` reads them from a local folder instead.
 
 ## Usage
 
 ```bash
-./rb.sh gen --image path/to/image.png                          # 512, INT4 DiTs + INT8 decoders (default)
-./rb.sh gen --pipeline 1024_cascade --image path/to/image.png
-./rb.sh gen --stock --tag base --image path/to/image.png       # unmodified pipeline, as a reference
-./rb.sh gen --dec_bits 0 --image ...                           # INT4 DiTs, fp16 decoders
+./generate.sh --image photo.png                          # 512 pipeline -> outputs/photo_s42.glb + .png preview
+./generate.sh --image photo.png --pipeline 1024_cascade  # higher resolution, more VRAM
+./generate.sh --image photo.png --stock                  # unmodified bf16 / fp16 models, as a reference
 ```
 
-Outputs go to `runs/trellis2/<tag>_<image>_s<seed>.{ply,png}` (mesh + a 2x2 render grid: shaded / normals, PBR
-channels); a run with a `base_...ply` for the same image and seed also reports the chamfer distance to it. `rb.sh`
-caps host RAM at 13 GB (`RB_MEM`): the low-VRAM pipeline keeps all models in host RAM. Options: `--seed`, `--sampler`
-(JSON, e.g. step counts), `--load ''` (no INT DiTs), `--dec_bits 0|4|8`, `--cond bf16|int8` (image encoder;
-**experimental**, changes the sample; fp16 overflows to NaN). The other options of `scripts/rb_trellis2.py`
-(`capture`, `tune`, `--bridges`, `--teacache`, `--dvec`, ...) belong to the calibration / research tools of the full
-RoundBit repository and need files that are not part of this one.
+Output: `outputs/<image>[_<pipeline>]_s<seed>.glb` (textured PBR mesh) and a 2x2 render grid `.png`
+(shaded / normals, PBR channels). Example inputs are in `assets/example_image/`.
+
+Options: `--seed`, `--out DIR`, `--symmetry off|auto|x|xy...` (enforce mirror symmetry, z up),
+`--sampler` (JSON per stage, e.g. `{"shape": {"steps": 24}}`), `--fp16_decoders`, `--faces` / `--texture_size`
+(GLB), `--no_preview`, `--no_warmup` (skip the 1-step warm-up run that also autotunes the kernels).
+
+Environment: `RB_MEM` host-RAM cap (default 13G, applied through `systemd-run` when available; the low-VRAM
+pipeline keeps models in host RAM), `TRELLIS_MODEL_CACHE_GB` (models kept in RAM, default 5),
+`TRELLIS_REMBG=auto|transparent_background|birefnet`, `ROUNDBIT_INT4_KERNEL=0` (no Triton INT4 kernels),
+`TRELLIS_PYTHON` (interpreter, default `.venv/bin/python`), `TRELLIS_PLATFORM=cuda|rocm` (default: what `setup.sh`
+built for).
 
 ## Layout
 
 ```
-rb.sh                        wrapper: runs scripts/rb_trellis2.py in the TRELLIS.2 checkout with a RAM cap
-scripts/rb_trellis2.py       gen (load INT models, generate, render, chamfer), save_dec, capture / tune
-scripts/dec_quant.py         weight-only INT8 / INT4 for the latent decoders
-roundbit/                    runtime subset of RoundBit: IntLinear / Int4Linear packed format, Triton INT4 kernels
-patches/                     TRELLIS.2-ROCm patch + the upstream commit it applies to
+generate.sh / generate.py   image -> GLB (+ preview) with the INT models; generate.sh adds the RAM cap
+run.sh                      runs a script in .venv with the platform's environment settings
+setup.sh                    builds .venv and the native extensions (CUDA or ROCm)
+roundbit/                   INT runtime: Int4Linear + Triton INT4 kernels, INT8 decoder layers
+trellis2/                   TRELLIS.2 inference code (lazy / meta-device model loading, symmetry)
+o-voxel/                    TRELLIS.2 voxel / mesh extension (built by setup.sh), GLB export
+patches/                    nvdiffrast-hip fixes applied by setup.sh
+assets/                     example images, HDRI for the preview renders
 ```
+
+`trellis2/`, `o-voxel/` and the ROCm part of `setup.sh` come from [TRELLIS.2-ROCm](https://github.com/Mateusz-Dera/TRELLIS.2-ROCm)
+(commit `aa1528a`) with the low-VRAM, meta-device loading (`trellis2.models.META_HOOKS`: quantized layers are
+swapped in before the original weights are allocated), transformers 5, rembg-fallback and symmetry changes;
+training code, datasets and the texturing pipeline are left out. `o-voxel/` is identical to microsoft/TRELLIS.2's; the
+CUDA part of `setup.sh` follows microsoft/TRELLIS.2's setup.
 
 ## Licence
 
-TRELLIS.2 and TRELLIS.2-ROCm are MIT (the patch is a change to that code). The RoundBit layer code in `roundbit/`
-builds on LittleBit (CC BY-NC 4.0): private, non-commercial use.
+TRELLIS.2 and TRELLIS.2-ROCm are MIT (`LICENSE-TRELLIS.2`). The RoundBit layer code in `roundbit/` builds on
+LittleBit (CC BY-NC 4.0): private, non-commercial use. The model weights follow the licences of
+`microsoft/TRELLIS.2-4B` and the encoders it uses.
