@@ -124,6 +124,21 @@ def _build_on_meta(config, model_file: str, device, kwargs, path: str = ""):
     return model
 
 
+def _override_dtype(config) -> None:
+    """bf16 models (the flow DiTs) run in fp16 on GPUs without native bf16 (NVIDIA before Ampere): there xformers
+    has no bf16 attention kernel and bf16 math is emulated. TRELLIS_DIT_DTYPE=float16|bfloat16 forces a dtype."""
+    import os
+    import torch
+    args = config.get('args', {})
+    if args.get('dtype') not in ('bf16', 'bfloat16'):
+        return
+    forced = os.environ.get('TRELLIS_DIT_DTYPE', '')
+    if forced:
+        args['dtype'] = forced
+    elif torch.cuda.is_available() and not torch.cuda.is_bf16_supported(including_emulation=False):
+        args['dtype'] = 'float16'
+
+
 def from_pretrained(path: str, device=None, **kwargs):
     """
     Load a model from a pretrained checkpoint.
@@ -154,6 +169,7 @@ def from_pretrained(path: str, device=None, **kwargs):
 
     with open(config_file, 'r') as f:
         config = json.load(f)
+    _override_dtype(config)
     if device is not None and str(device) != 'cpu':
         import torch
         if os.environ.get('TRELLIS_META_INIT', '1') != '0':

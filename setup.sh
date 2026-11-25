@@ -2,8 +2,8 @@
 # Build .venv for TRELLIS.2-ROCm-INT4 on AMD (ROCm) or NVIDIA (CUDA) GPUs.
 #   ./setup.sh            platform detected (nvidia-smi -> cuda, rocminfo -> rocm)
 #   ./setup.sh --cuda     force NVIDIA      ./setup.sh --rocm   force AMD
-# env: TORCH_INDEX_URL (PyTorch wheel index; default rocm6.4 / cu128). CUDA builds need a CUDA Toolkit whose major
-#      version matches the PyTorch wheel (set CUDA_HOME if several are installed).
+# env: TORCH_INDEX_URL (PyTorch wheel index; default: rocm7.2 with a ROCm 7 install, else rocm6.4 / cu128). CUDA builds
+#      need a CUDA Toolkit whose major version matches the PyTorch wheel (set CUDA_HOME if several are installed).
 set -e  # Exit on error
 
 # Get the directory where this script is located
@@ -56,19 +56,34 @@ echo "Virtual environment created successfully!"
 source .venv/bin/activate
 
 if [ "$PLATFORM" = "rocm" ]; then
-    echo "Installing PyTorch with ROCm support..."
-    uv pip install torch torchvision --index-url "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm6.4}"
+    # PyTorch wheel for the installed ROCm major version: the extensions are compiled with the system hipcc and must
+    # use the same HIP runtime as torch
+    ROCM_VER="$(cat "${ROCM_PATH:-/opt/rocm}/.info/version" 2>/dev/null || true)"
+    case "$ROCM_VER" in
+        7.*) DEFAULT_INDEX=https://download.pytorch.org/whl/rocm7.2 ;;
+        *)   DEFAULT_INDEX=https://download.pytorch.org/whl/rocm6.4 ;;
+    esac
+    echo "Installing PyTorch with ROCm support (system ROCm ${ROCM_VER:-unknown})..."
+    uv pip install torch torchvision --index-url "${TORCH_INDEX_URL:-$DEFAULT_INDEX}"
+    # flash-attn below: Triton backend (the default CK backend is a very long hipcc build)
+    export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
 else
     echo "Installing PyTorch with CUDA support..."
     uv pip install torch torchvision --index-url "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 fi
 
 echo "Installing additional dependencies..."
-uv pip install imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers zstandard huggingface_hub
+uv pip install imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers zstandard huggingface_hub OpenEXR
 uv pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 uv pip install pillow-simd
 uv pip install kornia timm
-uv pip install flash-attn==2.8.3 --no-build-isolation
+# flash-attn has no kernels before Ampere (compute capability 8.0): those GPUs use PyTorch SDPA (run.sh)
+MIN_CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sort -n | head -1 || true)"
+if [ "$PLATFORM" = "cuda" ] && [ -n "$MIN_CC" ] && [ "${MIN_CC%%.*}" -lt 8 ]; then
+    echo "GPU compute capability $MIN_CC < 8.0: skipping flash-attn (attention runs on PyTorch SDPA)"
+else
+    uv pip install flash-attn==2.8.3 --no-build-isolation
+fi
 
 echo "Dependencies installed successfully!"
 
@@ -76,6 +91,22 @@ echo "Dependencies installed successfully!"
 
 # AMD: the CUDA extensions are converted with hipify and patched for ROCm / RDNA3
 build_rocm() {
+# Torch headers after hipify: older hipify-perl writes ATen/cuda/HIPContext.h, hipify-perl 7.x leaves
+# ATen/cuda/CUDAContext.h / c10/cuda/*.h untouched; the ROCm torch wheel has them only under ATen/hip, c10/hip.
+fix_torch_includes() {
+    find . -type f \( -name "*.cu" -o -name "*.cuh" -o -name "*.cpp" -o -name "*.h" \) -not -path "*/eigen/*" \
+        -exec sed -i -e 's|ATen/cuda/HIPContext\.h|ATen/hip/HIPContext.h|g' \
+                     -e 's|ATen/cuda/CUDAContext\.h|ATen/hip/HIPContext.h|g' \
+                     -e 's|c10/cuda/CUDAStream\.h|c10/hip/HIPStream.h|g' \
+                     -e 's|c10/cuda/CUDAGuard\.h|c10/hip/HIPGuard.h|g' {} +
+}
+
+# PyTorch >= 2.10 headers need C++20; the extensions' setup.py files ask for C++17.
+cxx20() {
+    find "$1" -name setup.py -not -path "*/eigen/*" \
+        -exec sed -i -e 's/c++17/c++20/g' -e 's/^cpp_standard = 17/cpp_standard = 20/' {} +
+}
+
 # nvdiffrast-hip
 if [ -d "./nvdiffrast-hip" ]; then
     rm -rf ./nvdiffrast-hip
@@ -115,8 +146,8 @@ echo "Applying ROCm-specific fixes..."
 # Fix __shfl_*_sync mask - ROCm requires 64-bit mask instead of 32-bit
 find . -type f \( -name "*.cu" -o -name "*.hip" -o -name "*.cpp" -o -name "*.h" \) -exec sed -i 's/__shfl\([^(]*\)_sync(0xFFFFFFFF,/__shfl\1_sync(0xFFFFFFFFFFFFFFFFULL,/g' {} \;
 
-# Fix incorrect hipify conversion: ATen/cuda/HIPContext.h should be ATen/hip/HIPContext.h
-find . -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i 's|ATen/cuda/HIPContext\.h|ATen/hip/HIPContext.h|g' {} \;
+# Torch CUDA headers -> ATen/hip, c10/hip (see fix_torch_includes)
+fix_torch_includes
 
 # Remove CUDAUtils.h include as it's not needed and not available in ROCm PyTorch
 find . -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i 's|#include <ATen/cuda/CUDAUtils\.h>|// #include <ATen/cuda/CUDAUtils.h> // Removed for ROCm|g' {} \;
@@ -178,8 +209,8 @@ echo "Applying ROCm-specific fixes..."
 # Fix __shfl_*_sync mask - ROCm requires 64-bit mask
 find . -type f \( -name "*.cu" -o -name "*.hip" -o -name "*.cpp" -o -name "*.h" -o -name "*.cuh" \) -exec sed -i 's/__shfl\([^(]*\)_sync(0xFFFFFFFF,/__shfl\1_sync(0xFFFFFFFFFFFFFFFFULL,/g' {} \;
 
-# Fix HIPContext includes
-find . -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i 's|ATen/cuda/HIPContext\.h|ATen/hip/HIPContext.h|g' {} \;
+# Torch CUDA headers -> ATen/hip, c10/hip (see fix_torch_includes)
+fix_torch_includes
 
 # Remove CUDAUtils includes
 find . -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i 's|#include <ATen/cuda/CUDAUtils\.h>|// #include <ATen/cuda/CUDAUtils.h> // Removed for ROCm|g' {} \;
@@ -217,9 +248,13 @@ with open('src/clean_up.cu', 'r') as f:
     content = f.read()
 
 # Pattern to match the two DeviceRadixSort calls plus the resize between them
-pattern = r'    CUDA_CHECK\(hipcub::DeviceRadixSort::SortPairs\(\s*nullptr,.*?\)\);\s*this->cub_temp_storage\.resize\(temp_storage_bytes\);\s*CUDA_CHECK\(hipcub::DeviceRadixSort::SortPairs\(.*?int3_decomposer\{\}\s*\)\);'
+# (CuMesh since 4843631 passes the CUDA stream as the last argument)
+pattern = r'    CUDA_CHECK\(hipcub::DeviceRadixSort::SortPairs\(\s*nullptr,.*?\)\);\s*this->cub_temp_storage\.resize\(temp_storage_bytes\);\s*CUDA_CHECK\(hipcub::DeviceRadixSort::SortPairs\(.*?int3_decomposer\{\}\s*(,\s*stream\s*)?\)\);'
 
-replacement = '''    // Use thrust::sort_by_key instead of hipcub with decomposer (not supported in ROCm)
+def replacement(m):
+    # with a stream argument the preceding kernels ran on `stream`: wait for them before the null-stream copies
+    sync = '    CUDA_CHECK(hipStreamSynchronize(stream));\n' if m.group(1) else ''
+    return sync + '''    // Use thrust::sort_by_key instead of hipcub with decomposer (not supported in ROCm)
     CUDA_CHECK(hipMemcpy(cu_sorted_faces_output, cu_sorted_faces, F * sizeof(int3), hipMemcpyDeviceToDevice));
     CUDA_CHECK(hipMemcpy(cu_sorted_indices_output, cu_sorted_face_indices, F * sizeof(int), hipMemcpyDeviceToDevice));
 
@@ -229,7 +264,9 @@ replacement = '''    // Use thrust::sort_by_key instead of hipcub with decompose
 
     CUDA_CHECK(hipDeviceSynchronize());'''
 
-content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+content, n = re.subn(pattern, replacement, content, flags=re.DOTALL)
+if n != 1:
+    raise SystemExit(f"CuMesh clean_up.cu: DeviceRadixSort patch matched {n} times (expected 1); CuMesh changed upstream")
 
 with open('src/clean_up.cu', 'w') as f:
     f.write(content)
@@ -284,6 +321,7 @@ find third_party/cubvh -type f \( -name "*.cu" -o -name "*.cpp" -o -name "*.h" -
 
 cd ..
 echo "Installing CuMesh..."
+cxx20 ./CuMesh
 uv pip install ./CuMesh --no-build-isolation
 
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -313,6 +351,7 @@ fi
 
 cd ..
 echo "Installing FlexGEMM..."
+cxx20 ./FlexGEMM
 uv pip install ./FlexGEMM --no-build-isolation
 
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -334,8 +373,8 @@ echo "Applying ROCm-specific fixes to o-voxel..."
 # Fix __shfl_*_sync mask - ROCm requires 64-bit mask
 find . -type f \( -name "*.cu" -o -name "*.hip" -o -name "*.cpp" -o -name "*.h" -o -name "*.cuh" \) -exec sed -i 's/__shfl\([^(]*\)_sync(0xFFFFFFFF,/__shfl\1_sync(0xFFFFFFFFFFFFFFFFULL,/g' {} \;
 
-# Fix HIPContext includes
-find . -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i 's|ATen/cuda/HIPContext\.h|ATen/hip/HIPContext.h|g' {} \;
+# Torch CUDA headers -> ATen/hip, c10/hip (see fix_torch_includes)
+fix_torch_includes
 
 # Remove CUDAUtils includes
 find . -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i 's|#include <ATen/cuda/CUDAUtils\.h>|// #include <ATen/cuda/CUDAUtils.h> // Removed for ROCm|g' {} \;
@@ -395,6 +434,7 @@ fi
 
 cd ..
 echo "Installing o-voxel-hip..."
+cxx20 ./o-voxel-hip
 uv pip install ./o-voxel-hip --no-build-isolation
 }
 

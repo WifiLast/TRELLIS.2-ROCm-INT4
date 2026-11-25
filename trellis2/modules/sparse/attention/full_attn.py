@@ -193,6 +193,20 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+    elif config.ATTN == 'sdpa':
+        # PyTorch SDPA per sequence (no extra package; on ROCm it uses torch's own AOTriton kernels)
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        outs, q0, k0 = [], 0, 0
+        for lq, lk in zip(q_seqlen, kv_seqlen):
+            qi = q[q0:q0 + lq].transpose(0, 1).unsqueeze(0)     # [1, H, Lq, C]
+            ki = k[k0:k0 + lk].transpose(0, 1).unsqueeze(0)
+            vi = v[k0:k0 + lk].transpose(0, 1).unsqueeze(0)
+            outs.append(torch.nn.functional.scaled_dot_product_attention(qi, ki, vi)[0].transpose(0, 1))
+            q0, k0 = q0 + lq, k0 + lk
+        out = torch.cat(outs, dim=0)    # [T_Q, H, Co]
     elif config.ATTN == 'flash_attn_3':
         if 'flash_attn_3' not in globals():
             import flash_attn_interface as flash_attn_3

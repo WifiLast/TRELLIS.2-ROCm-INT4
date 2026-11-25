@@ -19,12 +19,23 @@ unset TORCH_LOGS
 
 if [ "$PLATFORM" = "rocm" ]; then
     export TRITON_DEFAULT_BACKEND="${TRITON_DEFAULT_BACKEND:-amd}"
+    # flash-attn on ROCm is the Triton build (setup.sh): without this it looks for the CUDA extension flash_attn_2_cuda
+    export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+    # PyTorch SDPA by default: flash-attn 2.8.3's Triton AMD kernels do not import with Triton >= 3.9 (torch >= 2.14)
+    export ATTN_BACKEND="${ATTN_BACKEND:-sdpa}"
     export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
     # expandable_segments corrupts tensors on this ROCm stack.
     unset PYTORCH_ALLOC_CONF PYTORCH_HIP_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF
     # Shell debug defaults that only add noise / fill /tmp with comgr temp files.
     unset AMD_COMGR_SAVE_TEMPS AMD_COMGR_EMIT_VERBOSE_LOGS
     export AMD_LOG_LEVEL=0
+else
+    # GPUs before Ampere (compute capability < 8.0): no flash-attn kernels (setup.sh skips it) -> PyTorch SDPA.
+    # The bf16 DiTs are loaded in fp16 there (trellis2/models/__init__.py).
+    MIN_CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sort -n | head -1 || true)"
+    if [ -n "$MIN_CC" ] && [ "${MIN_CC%%.*}" -lt 8 ]; then
+        export ATTN_BACKEND="${ATTN_BACKEND:-sdpa}"
+    fi
 fi
 
 cd "$HERE"

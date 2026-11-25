@@ -6,7 +6,9 @@ repository is self-contained: it includes the TRELLIS.2 code (with low-VRAM load
 model weights are downloaded, from Hugging Face.
 
 Developed and measured on an AMD RX 7900 XTX. The NVIDIA path follows microsoft/TRELLIS.2's own CUDA setup and uses the
-same code (the INT4 kernels are Triton, which runs on both); it has not been tested on NVIDIA hardware yet.
+same code (the INT4 kernels are Triton, which runs on both). Tested from a fresh clone on an RX 7900 XTX (ROCm 7.14,
+PyTorch 2.14 rocm7.2 wheels) and on an NVIDIA Turing GPU (sm_75, CUDA 12.8, PyTorch 2.11 cu128): the 512 pipeline
+produces the same gear on both (1.2 GiB peak VRAM).
 
 ## Results (RX 7900 XTX, seed 42, T.png / bear / gear example images)
 
@@ -26,7 +28,9 @@ against the source image; chamfer distance (~0.004) does not show missing or inv
 
 Linux, [uv](https://docs.astral.sh/uv/), `git`, `libjpeg-dev`, and for your GPU:
 
-- **AMD:** ROCm and HIPIFY of the same version (tested: RX 7900 XTX). Set the GPU architecture first:
+- **AMD:** ROCm with HIPIFY (tested: ROCm 7.14, RX 7900 XTX). `setup.sh` installs the PyTorch wheels for the ROCm
+  major version it finds in `$ROCM_PATH/.info/version` (ROCm 7: `rocm7.2`, otherwise `rocm6.4`; override with
+  `TORCH_INDEX_URL`). Set the GPU architecture first:
   ```bash
   export ROCM_PATH=/opt/rocm
   export HSA_OVERRIDE_GFX_VERSION=11.0.0   # RX 7900 XTX
@@ -35,16 +39,33 @@ Linux, [uv](https://docs.astral.sh/uv/), `git`, `libjpeg-dev`, and for your GPU:
   ```
 - **NVIDIA:** a CUDA Toolkit (`nvcc`) whose major version matches the PyTorch wheel (default: CUDA 12.8 wheels;
   pick another with `TORCH_INDEX_URL`, e.g. `https://download.pytorch.org/whl/cu124`). With several toolkits
-  installed, set `CUDA_HOME`. GPUs without flash-attn support (before Ampere): install `xformers` into `.venv` and set `ATTN_BACKEND=xformers`.
+  installed, set `CUDA_HOME`. `nvcc` refuses host compilers newer than it supports (CUDA 12.8: GCC 13 at most); with a
+  newer system GCC point it at an older one:
+  ```bash
+  export CC=gcc-13 CXX=g++-13 NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-13"
+  ```
+  GPUs before Ampere (compute capability < 8.0, e.g. Turing) work without extra packages: `setup.sh` skips
+  flash-attn (it has no kernels for them), `run.sh` selects PyTorch SDPA attention, and the bf16 flow DiTs run in
+  fp16 (no bf16 hardware there).
+
+Build the extensions with GCC (the default `CC`/`CXX`); `o-voxel` does not compile with clang.
 
 ```bash
 ./setup.sh            # detects the platform (nvidia-smi / rocminfo); force with --cuda or --rocm
 ```
 
-`setup.sh` creates `.venv` (Python 3.11, PyTorch, flash-attn, Triton) and builds the native extensions nvdiffrast,
-nvdiffrec, CuMesh, FlexGEMM and `o-voxel/` (from this repo). On NVIDIA they build unchanged; on AMD they are
-converted with hipify and patched (nvdiffrast-hip with the RDNA3 rasterizer fixes in `patches/`). It downloads
-those sources while it runs; afterwards nothing besides the models is fetched.
+`setup.sh` creates `.venv` (Python 3.11, PyTorch, Triton, flash-attn where it is usable) and builds the native
+extensions nvdiffrast, nvdiffrec, CuMesh, FlexGEMM and `o-voxel/` (from this repo). On NVIDIA they build unchanged; on
+AMD they are converted with hipify and patched (nvdiffrast-hip with the RDNA3 rasterizer fixes in `patches/`). It
+downloads those sources while it runs; afterwards nothing besides the models is fetched.
+
+Attention backend: PyTorch SDPA on AMD (flash-attn 2.8.3's Triton kernels do not load with the Triton of PyTorch
+2.14) and on NVIDIA GPUs before Ampere, flash-attn on newer NVIDIA GPUs. `ATTN_BACKEND=sdpa|flash_attn|xformers`
+overrides it.
+
+First run on a new GPU: FlexGEMM benchmarks its sparse-convolution kernels for every new layer shape and caches the
+winners in `~/.flex_gemm/autotune_cache.json`. On a fast GPU that is part of the warm-up; on a slow one the first
+generation can take much longer than later ones.
 
 Models (downloaded on first use into the Hugging Face cache):
 
@@ -85,7 +106,8 @@ Environment: `RB_MEM` host-RAM cap (default 13G, applied through `systemd-run` w
 pipeline keeps models in host RAM), `TRELLIS_MODEL_CACHE_GB` (models kept in RAM, default 5),
 `TRELLIS_REMBG=auto|transparent_background|birefnet`, `ROUNDBIT_INT4_KERNEL=0` (no Triton INT4 kernels),
 `TRELLIS_PYTHON` (interpreter, default `.venv/bin/python`), `TRELLIS_PLATFORM=cuda|rocm` (default: what `setup.sh`
-built for).
+built for), `ATTN_BACKEND=sdpa|flash_attn|xformers` (see Setup), `TRELLIS_DIT_DTYPE=float16|bfloat16` (flow DiT
+precision; default bf16, fp16 on GPUs without native bf16).
 
 ## Layout
 
