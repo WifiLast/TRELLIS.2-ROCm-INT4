@@ -7,15 +7,33 @@ model weights are downloaded, from Hugging Face.
 
 Developed and measured on an AMD RX 7900 XTX. The NVIDIA path follows microsoft/TRELLIS.2's own CUDA setup and uses the
 same code (the INT4 kernels are Triton, which runs on both). Tested from a fresh clone on an RX 7900 XTX (ROCm 7.14,
-PyTorch 2.14 rocm7.2 wheels) and on an NVIDIA Turing GPU (sm_75, CUDA 12.8, PyTorch 2.11 cu128): the 512 pipeline
-produces the same gear on both (1.2 GiB peak VRAM).
+PyTorch 2.14 rocm7.2 wheels) and on an NVIDIA Turing GPU (sm_75, CUDA 12.8, PyTorch 2.11 cu128).
+
+## Examples
+
+512 pipeline, seed 42, front view: shaded render and normal map (geometry) of the generated GLB.
+
+```bash
+./generate.sh --image assets/example_image/T.png
+```
+
+![T: input, stock, INT4 + INT8 on AMD and NVIDIA](assets/readme/example_T.jpg)
+
+```bash
+./generate.sh --image assets/example_image/5c80e5e03a3b60b6f03eaf555ba1dafc0e4230c472d7e8c8e2c5ca0a0dfcef10.webp
+```
+
+![Bear: input, stock, INT4 + INT8 on AMD](assets/readme/example_bear.jpg)
+
+"stock" is `--stock` (the unmodified bf16 / fp16 models). The NVIDIA run (Turing, fp16 DiTs, SDPA) used
+`--sampler '{"ss":{"steps":6},"shape":{"steps":6},"tex":{"steps":6}}'` instead of the default 12 steps.
 
 ## Results (RX 7900 XTX, seed 42, T.png / bear / gear example images)
 
 | | weights the pipeline loads | peak VRAM | quality |
 |---|---|---|---|
 | 512, stock (bf16 DiTs, fp16 decoders, fp32 image encoder) | 11.0 GB | 2.72 GiB (T) | reference |
-| **512, INT4 DiTs + INT8 decoders (default)** | **4.4 GB** | **2.02 GiB** (T), 1.96 (bear), 1.25 (gear) | geometry checked against the source images at full resolution: gear 7 spokes like the source, rim intact; bear on par |
+| **512, INT4 DiTs + INT8 decoders (default)** | **4.4 GB** | **2.02 GiB** (T), 1.96 (bear), 1.25 (gear) | see [Examples](#examples) |
 | 1024_cascade, stock | – | 7.19 GiB (T), 6.85 (bear), 5.14 (gear) | reference |
 | 1024_cascade, INT4 + INT8 decoders | – | 6.26 GiB (T), 6.34 (bear), 2.39 (gear) | geometry on par; T loses the teal glass cylinder (dark metal tube instead) |
 
@@ -96,7 +114,15 @@ Only the files the chosen pipeline needs are downloaded. `--models_dir DIR` read
 ```
 
 Output: `outputs/<image>[_<pipeline>]_s<seed>.glb` (textured PBR mesh) and a 2x2 render grid `.png`
-(shaded / normals, PBR channels). Example inputs are in `assets/example_image/`.
+(shaded / normals, PBR channels). Example inputs are in `assets/example_image/`. A run prints, for example:
+
+```
+{"generate_s": 19.0, "peak_vram_gib": 1.94, "int_layers": {"sparse_structure_flow_model": 210, "shape_slat_flow_model_512": 210, "tex_slat_flow_model_512": 210, "shape_slat_decoder": 104, "tex_slat_decoder": 104}}
+preview: outputs/T_s42.png
+model: outputs/T_s42.glb
+```
+
+`int_layers` lists the INT layers swapped into each model; an empty `{}` means the stock models ran.
 
 Options: `--seed`, `--out DIR`, `--symmetry off|auto|x|xy...` (enforce mirror symmetry, z up),
 `--sampler` (JSON per stage, e.g. `{"shape": {"steps": 24}}`), `--fp16_decoders`, `--faces` / `--texture_size`
