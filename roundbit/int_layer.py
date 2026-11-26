@@ -5,6 +5,11 @@ DiT files (<model>.pt): {"layers": {"<block>.<linear>": (state, meta)}, "info": 
            s fp16 (out, n_groups), optional bias fp16, optional R fp32 (per-group rotation, codes in rotated basis)
     meta:  {"in", "out", "bits", "group", "bias", "sparse"}
 Decoder files (<decoder>.int8.pt): {"layers": {"<module name>": {"wq", "ws", "wshape", "wdtype", "wfan", "wbits"}}}
+Stack files (RoundBit save_stack):
+    bridges.pt                 {"models": {"<dit>": [{"i", "len", "kind", "W"}]}}: block i (+len-1 more) of that DiT
+                               replaced by one linear bridge x + [x, 1] W; the DiT file then lacks those blocks
+                               (info["bridged"]) and must be loaded with its bridges
+    image_cond_model.int8.pt   DINOv3 ViT-L: bf16 tensors + INT8 g128 linears ({"q", "params", "buffers"})
 """
 from __future__ import annotations
 
@@ -119,10 +124,54 @@ def apply_dit_file(model: nn.Module, path, device="cuda") -> int:
     info = state.get("info", {})
     if "blocks_done" in info and info["blocks_done"] != info.get("n_blocks"):
         raise RuntimeError(f"{path}: incomplete file ({info['blocks_done']} of {info.get('n_blocks')} blocks)")
+    skip = getattr(model, "_rb_bridged_blocks", set())
+    need = {j for s in info.get("bridged", []) for j in range(s["i"], s["i"] + s["len"])}
+    if not need <= skip:
+        raise RuntimeError(f"{path}: blocks {sorted(need - skip)} are replaced by bridges in this file; "
+                           f"load it together with bridges.pt (do not pass --no_bridges)")
+    n = 0
     for name, (sd, meta) in state["layers"].items():
+        if int(name.split(".")[0]) in skip:
+            continue
         layer = load_packed(sd, meta, device)
         _set(model.blocks, name, SparseInt(layer) if meta["sparse"] else layer)
-    return len(state["layers"])
+        n += 1
+    return n
+
+
+# ── block-span bridges: one closed-form linear map in place of a near-linear DiT block ──────────────────────
+class SpanBridge(nn.Module):
+    """x + [x, 1] W in fp32 (dense or sparse input); the block's other arguments (t_emb, cond, ...) are ignored"""
+
+    def __init__(self, W):
+        super().__init__()
+        self.register_buffer("W", W.float())
+
+    def forward(self, x, *args, **kwargs):
+        f = x.feats if hasattr(x, "feats") else x
+        shp = f.shape
+        f2 = f.reshape(-1, shp[-1]).float()
+        y = (f2 + f2 @ self.W[:-1] + self.W[-1]).to(f.dtype).reshape(shp)
+        return x.replace(y) if hasattr(x, "feats") else y
+
+
+class SpanSkip(nn.Module):
+    def forward(self, x, *args, **kwargs):
+        return x
+
+
+def apply_bridges(model: nn.Module, spans: list, device="cuda") -> int:
+    """Replace the bridged blocks (call before apply_dit_file; on the meta device they are never allocated).
+    Returns the number of blocks replaced."""
+    done = getattr(model, "_rb_bridged_blocks", set())
+    for s in spans:
+        i, L = s["i"], s["len"]
+        model.blocks[i] = SpanBridge(s["W"]).to(device) if s["kind"] == "linear" else SpanSkip()
+        for j in range(i + 1, i + L):
+            model.blocks[j] = SpanSkip()
+        done |= set(range(i, i + L))
+    model._rb_bridged_blocks = done
+    return len(done)
 
 
 # ── latent decoders: weight-only INT8 / INT4, dequantized per layer call ─────────────────────────────────────
@@ -161,3 +210,34 @@ def apply_decoder_file(model: nn.Module, path, device="cuda") -> int:
                 _classes[cls] = type("Q" + cls.__name__, (_QWeight, cls), {})
             m.__class__ = _classes[cls]
     return len(state["layers"])
+
+
+# ── DINOv3 image encoder: built from its config on the meta device + the INT8 file (no fp32 checkpoint read) ──
+def build_cond(cls, name: str, path) -> nn.Module:
+    from transformers import AutoConfig
+
+    st = torch.load(path, map_location="cpu")
+    with torch.device("meta"):
+        m = cls(AutoConfig.from_pretrained(name))
+    for mn, q in st["q"].items():
+        mod = m.get_submodule(mn)
+        mod._parameters.pop("weight", None)
+        mod.wshape, mod.wdtype, mod.wfan, mod.wbits = torch.Size(q["wshape"]), getattr(torch, q["wdtype"]), q["wfan"], q["wbits"]
+        c = type(mod)
+        if c not in _classes:
+            _classes[c] = type("Q" + c.__name__, (_QWeight, c), {})
+        mod.__class__ = _classes[c]
+    for kind, tab in (("p", st["params"]), ("b", st["buffers"])):
+        for full, t in tab.items():
+            mn, _, pn = full.rpartition(".")
+            mod = m.get_submodule(mn)
+            if kind == "p":
+                mod._parameters[pn] = nn.Parameter(t, requires_grad=False)
+            else:
+                mod._buffers[pn] = t
+    left = [n for n, t in list(m.named_parameters()) + list(m.named_buffers()) if t.is_meta]
+    left += [f"{mn}.{k}" for mn, mod in m.named_modules() for k, v in vars(mod).items()
+             if isinstance(v, torch.Tensor) and v.is_meta]
+    if left:
+        raise RuntimeError(f"{path}: tensors missing from the file: {left[:5]}")
+    return m.eval()

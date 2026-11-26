@@ -5,7 +5,13 @@
     ./generate.sh --image photo.png --stock                       # unmodified bf16 / fp16 models (reference)
 
 The INT model files are downloaded from the Hugging Face model repo in $RB_MODEL_REPO (or read from --models_dir);
-everything else (norms, embeddings, sparse-structure decoder, DINOv3 image encoder) comes from microsoft/TRELLIS.2-4B.
+everything else (norms, embeddings, sparse-structure decoder) comes from microsoft/TRELLIS.2-4B.
+Optional stack files next to them (used when present, old model sets without them still work):
+    bridges.pt                 block 29 of the shape / texture 512 DiTs replaced by a linear bridge (the DiT files
+                               then lack that block and need it; --no_bridges only works with unstripped files)
+    image_cond_model.int8.pt   DINOv3 image encoder in INT8 (309 MB instead of the 1213 MB fp32 checkpoint, which
+                               is then never downloaded or read; only its config.json). Not used on GPUs without
+                               native bf16 (NVIDIA before Ampere): fp16 overflows inside DINOv3, so fp32 there.
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
 import torch  # noqa: E402
 
-from roundbit.int_layer import apply_decoder_file, apply_dit_file  # noqa: E402
+from roundbit.int_layer import apply_bridges, apply_decoder_file, apply_dit_file, build_cond  # noqa: E402
 
 MODEL_REPO = os.environ.get("RB_MODEL_REPO", "JustAnotherUser1/TRELLIS.2-ROCm-INT4")
 # flow DiTs each pipeline type runs
@@ -48,7 +54,44 @@ def model_files(keys: list[str], models_dir: str) -> dict[str, Path]:
     return {k: Path(hf_hub_download(MODEL_REPO, n)) for k, n in names.items()}
 
 
-def install_int_models(pipe, files: dict[str, Path]) -> dict:
+def optional_file(name: str, models_dir: str) -> Path | None:
+    """a stack file (bridges.pt, image_cond_model.int8.pt) if the model set has it, else None"""
+    if models_dir:
+        f = Path(models_dir) / name
+        return f if f.exists() else None
+    from huggingface_hub import hf_hub_download
+    try:
+        from huggingface_hub.errors import EntryNotFoundError
+    except ImportError:  # older huggingface_hub
+        from huggingface_hub.utils import EntryNotFoundError
+    try:
+        return Path(hf_hub_download(MODEL_REPO, name))
+    except EntryNotFoundError:
+        return None
+
+
+def load_pipeline(cond_file: Path | None):
+    """TRELLIS.2 pipeline; with cond_file the DINOv3 encoder is built from its config + the INT8 file
+    (DinoV3FeatureExtractor calls DINOv3ViTModel.from_pretrained through the module global)."""
+    import trellis2.modules.image_feature_extractor as ife
+    from trellis2.pipelines import Trellis2ImageTo3DPipeline
+
+    orig = ife.DINOv3ViTModel
+    if cond_file is not None:
+        class _Saved:
+            @staticmethod
+            def from_pretrained(name, *args, **kw):
+                return build_cond(orig, name, cond_file)
+        ife.DINOv3ViTModel = _Saved
+    try:
+        pipe = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+    finally:
+        ife.DINOv3ViTModel = orig
+    pipe.cuda()
+    return pipe
+
+
+def install_int_models(pipe, files: dict[str, Path], bridges: dict | None = None) -> dict:
     """Swap the INT layers in while the loader still has the model on the meta device (the replaced bf16 / fp16
     weights are never allocated), and after loading for models built the stock way. Runs again whenever the lazy
     model cache reloads a model."""
@@ -59,6 +102,8 @@ def install_int_models(pipe, files: dict[str, Path]) -> dict:
     done = {}
 
     def apply(key, model, device):
+        if bridges and key in bridges:  # first: the bridged blocks are skipped by the DiT file (never allocated)
+            done[f"{key}:bridged_blocks"] = apply_bridges(model, bridges[key], device)
         fn = apply_decoder_file if key in DECODERS else apply_dit_file
         model._rb_int = fn(model, files[key], device)
         done[key] = model._rb_int
@@ -119,6 +164,11 @@ def main():
                                                      "from the Hugging Face repo in $RB_MODEL_REPO)")
     ap.add_argument("--stock", action="store_true", help="unmodified pipeline (bf16 DiTs, fp16 decoders)")
     ap.add_argument("--fp16_decoders", action="store_true", help="INT4 DiTs, but the original fp16 decoders")
+    ap.add_argument("--no_bridges", action="store_true",
+                    help="ignore bridges.pt (only for DiT files that still contain the bridged blocks)")
+    ap.add_argument("--cond", default="auto", choices=["auto", "int8", "fp32"],
+                    help="DINOv3 image encoder: int8 = image_cond_model.int8.pt from the model set, fp32 = stock; "
+                         "auto = int8 when the file exists and the GPU has native bf16, else fp32")
     ap.add_argument("--symmetry", default="off", help="off | auto | explicit axes such as x, xy (z is up)")
     ap.add_argument("--sampler", default="",
                     help='JSON sampler overrides per stage, e.g. {"shape": {"steps": 24}, "tex": {"steps": 24}}')
@@ -131,8 +181,6 @@ def main():
 
     from PIL import Image
 
-    from trellis2.pipelines import Trellis2ImageTo3DPipeline
-
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     pt = "" if a.pipeline == "512" else f"_{a.pipeline}"
@@ -140,9 +188,24 @@ def main():
 
     keys = [] if a.stock else PIPELINES[a.pipeline] + ([] if a.fp16_decoders else DECODERS)
     files = model_files(keys, a.models_dir)
-    pipe = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-    pipe.cuda()
-    loaded = install_int_models(pipe, files) if files else {}
+    bridges = {}
+    if files and not a.no_bridges:
+        bf = optional_file("bridges.pt", a.models_dir)
+        if bf is not None:
+            bridges = {k: v for k, v in torch.load(bf, map_location="cpu")["models"].items() if k in files}
+    cond_file = None
+    if not a.stock and a.cond != "fp32":
+        bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
+        if a.cond == "int8" or bf16:
+            cond_file = optional_file("image_cond_model.int8.pt", a.models_dir)
+            if cond_file is None and a.cond == "int8":
+                sys.exit("--cond int8: the model set has no image_cond_model.int8.pt")
+            if cond_file is not None and not bf16:
+                print("warning: no native bf16 on this GPU, the INT8 DINOv3 (bf16 base) runs emulated", flush=True)
+    pipe = load_pipeline(cond_file)
+    loaded = install_int_models(pipe, files, bridges) if files else {}
+    if cond_file is not None:
+        loaded["image_cond_model"] = "int8"
 
     img = Image.open(a.image)
     run = dict(pipeline_type=a.pipeline, seed=a.seed, symmetry=a.symmetry)

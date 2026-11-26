@@ -1,7 +1,8 @@
 # TRELLIS.2-ROCm-INT4
 
 Image to 3D with [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) on AMD (ROCm) and NVIDIA (CUDA) GPUs, using
-calibrated **INT4 flow DiTs** and **INT8 latent decoders** (RoundBit, block-wise AutoRound-style calibration). The
+calibrated **INT4 flow DiTs**, **INT8 latent decoders** and an **INT8 DINOv3 image encoder**, with the last block of
+the shape and texture DiTs replaced by a linear bridge (RoundBit, block-wise AutoRound-style calibration). The
 repository is self-contained: it includes the TRELLIS.2 code (with low-VRAM loading) and the INT runtime. Only the
 model weights are downloaded, from Hugging Face.
 
@@ -40,9 +41,11 @@ instead of the default 12 steps.
 | | weights the pipeline loads | peak VRAM | quality |
 |---|---|---|---|
 | 512, stock (bf16 DiTs, fp16 decoders, fp32 image encoder) | 11.0 GB | 2.72 GiB (T) | reference |
-| **512, INT4 DiTs + INT8 decoders (default)** | **4.4 GB** | **2.02 GiB** (T), 1.96 (bear), 1.25 (gear) | see [Examples](#examples) |
+| 512, INT4 DiTs + INT8 decoders (model set before 2026-11-26) | 4.4 GB | 2.02 GiB (T), 1.96 (bear), 1.25 (gear) | see [Examples](#examples) |
+| **512, + bridges + INT8 image encoder (default with the current model set)** | **3.4 GB** | **2.03 GiB** (T), 1.96 (bear), 1.13 (gear) | same geometry as the row above on T, bear and gear (full-resolution views against the source images); colours shift slightly |
 | 1024_cascade, stock | – | 7.19 GiB (T), 6.85 (bear), 5.14 (gear) | reference |
 | 1024_cascade, INT4 + INT8 decoders | – | 6.26 GiB (T), 6.34 (bear), 2.39 (gear) | geometry on par; T loses the teal glass cylinder (dark metal tube instead) |
+| 1024_cascade with the current model set | – | not measured | not checked yet: the shape-512 bridge and the INT8 image encoder also run in the cascade |
 
 The INT4 DiTs change the sample a little (a 3D generator turns small weight changes into a slightly different
 object); the INT8 decoders are practically lossless (identical renders to the INT4-DiT run without them).
@@ -95,22 +98,29 @@ generation can take much longer than later ones.
 Models (downloaded on first use into the Hugging Face cache):
 
 - the INT files from the model repo in `RB_MODEL_REPO` (default `JustAnotherUser1/TRELLIS.2-ROCm-INT4`)
-- `microsoft/TRELLIS.2-4B`: the INT files replace only the quantized linear layers; norms, embeddings, the
-  sparse-structure decoder and the DINOv3 image encoder come from the original checkpoints
+- `microsoft/TRELLIS.2-4B`: the INT files replace only the quantized linear layers; norms, embeddings and the
+  sparse-structure decoder come from the original checkpoints
 - the DINOv3 encoder (`facebook/dinov3-vitl16-pretrain-lvd1689m`) and RMBG-2.0 are gated: accept their licences
-  on Hugging Face and log in (`hf auth login`). Without access to RMBG-2.0 the background removal falls back to
-  `transparent-background`.
+  on Hugging Face and log in (`hf auth login`). With `image_cond_model.int8.pt` in the model set only DINOv3's
+  `config.json` is downloaded, not its 1.2 GB weights. Without access to RMBG-2.0 the background removal falls back
+  to `transparent-background`.
 
 | INT file | used by | size |
 |---|---|---|
 | `sparse_structure_flow_model.pt` | 512, 1024_cascade | 678 MB |
-| `shape_slat_flow_model_512.pt` | 512, 1024_cascade | 678 MB |
-| `tex_slat_flow_model_512.pt` | 512 | 678 MB |
+| `shape_slat_flow_model_512.pt` | 512, 1024_cascade | 656 MB (block 29 removed, see `bridges.pt`; older sets: 678 MB) |
+| `tex_slat_flow_model_512.pt` | 512 | 656 MB (block 29 removed; older sets: 678 MB) |
 | `shape_slat_flow_model_1024.pt` | 1024_cascade | 678 MB |
 | `tex_slat_flow_model_1024.pt` | 1024_cascade | 678 MB |
 | `shape_slat_decoder.int8.pt`, `tex_slat_decoder.int8.pt` | both | 482 MB each |
+| `bridges.pt` | 512, 1024_cascade | 19 MB: linear bridges for block 29 of the shape / texture 512 DiTs |
+| `image_cond_model.int8.pt` | both | 309 MB: DINOv3 ViT-L, bf16 + INT8 linears (stock: 1213 MB fp32) |
 
 Only the files the chosen pipeline needs are downloaded. `--models_dir DIR` reads them from a local folder instead.
+`bridges.pt` and `image_cond_model.int8.pt` are used when the model set has them; model sets without them (full
+678 MB DiT files) still load as before. DiT files with a removed block refuse to load without `bridges.pt`.
+On GPUs without native bf16 (NVIDIA before Ampere) the INT8 image encoder is skipped and the fp32 one is used,
+because fp16 overflows inside DINOv3 (`--cond int8` forces it, bf16 then runs emulated).
 
 ## Usage
 
@@ -124,16 +134,21 @@ Output: `outputs/<image>[_<pipeline>]_s<seed>.glb` (textured PBR mesh) and a 2x2
 (shaded / normals, PBR channels). Example inputs are in `assets/example_image/`. A run prints, for example:
 
 ```
-{"generate_s": 19.0, "peak_vram_gib": 1.94, "int_layers": {"sparse_structure_flow_model": 210, "shape_slat_flow_model_512": 210, "tex_slat_flow_model_512": 210, "shape_slat_decoder": 104, "tex_slat_decoder": 104}}
-preview: outputs/T_s42.png
-model: outputs/T_s42.glb
+{"generate_s": 13.8, "peak_vram_gib": 1.13, "int_layers": {"image_cond_model": "int8", "sparse_structure_flow_model": 210, "shape_slat_flow_model_512:bridged_blocks": 1, "shape_slat_flow_model_512": 203, "tex_slat_flow_model_512:bridged_blocks": 1, "tex_slat_flow_model_512": 203, "shape_slat_decoder": 104, "tex_slat_decoder": 104}}
+preview: outputs/gear_clean_s42.png
+model: outputs/gear_clean_s42.glb
 ```
 
-`int_layers` lists the INT layers swapped into each model; an empty `{}` means the stock models ran.
+`int_layers` lists the INT layers swapped into each model (`:bridged_blocks` = blocks replaced by a bridge,
+`image_cond_model` = the INT8 DINOv3); an empty `{}` means the stock models ran.
 
 Options: `--seed`, `--out DIR`, `--symmetry off|auto|x|xy...` (enforce mirror symmetry, z up),
-`--sampler` (JSON per stage, e.g. `{"shape": {"steps": 24}}`), `--fp16_decoders`, `--faces` / `--texture_size`
+`--sampler` (JSON per stage, e.g. `{"shape": {"steps": 24}}`), `--fp16_decoders`, `--no_bridges` (only for model sets
+whose DiT files still contain the bridged block), `--cond auto|int8|fp32` (image encoder), `--faces` / `--texture_size`
 (GLB), `--no_preview`, `--no_warmup` (skip the 1-step warm-up run that also autotunes the kernels).
+
+The GLB export (remeshing + xatlas UV unwrap on the CPU) takes several minutes at the default `--faces 1000000
+--texture_size 4096`; `--faces 200000 --texture_size 2048` writes the gear in about a minute.
 
 Environment: `RB_MEM` host-RAM cap (default 13G, applied through `systemd-run` when available; the low-VRAM
 pipeline keeps models in host RAM), `TRELLIS_MODEL_CACHE_GB` (models kept in RAM, default 5),
@@ -148,7 +163,8 @@ precision; default bf16, fp16 on GPUs without native bf16).
 generate.sh / generate.py   image -> GLB (+ preview) with the INT models; generate.sh adds the RAM cap
 run.sh                      runs a script in .venv with the platform's environment settings
 setup.sh                    builds .venv and the native extensions (CUDA or ROCm)
-roundbit/                   INT runtime: Int4Linear + Triton INT4 kernels, INT8 decoder layers
+roundbit/                   INT runtime: Int4Linear + Triton INT4 kernels, INT8 decoder layers, block bridges,
+                            INT8 DINOv3 loader
 trellis2/                   TRELLIS.2 inference code (lazy / meta-device model loading, symmetry)
 o-voxel/                    TRELLIS.2 voxel / mesh extension (built by setup.sh), GLB export
 patches/                    nvdiffrast-hip fixes applied by setup.sh
